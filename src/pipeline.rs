@@ -33,8 +33,8 @@ use crate::parquet_out::{
 use crate::sso::SmallBytes;
 use crate::timestamp::parse_ts_padded;
 
-/// Shard counts scale with the input so a dedup shard (~20k records) and a
-/// person partition (~80k records) stay cache-sized.
+/// Shard counts scale with the input so a dedup shard (~10k records) and a
+/// person partition (~40k records) stay L2-sized.
 #[derive(Clone, Copy)]
 struct Bits {
     s1: u32,
@@ -45,9 +45,15 @@ impl Bits {
     fn for_event_bytes(bytes: u64) -> Self {
         let est = (bytes / 75).max(1);
         let lg = |target: u64| 64 - (est / target).max(1).leading_zeros() - 1;
+        let env = |k: &str, d: u64| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(d)
+        };
         Bits {
-            s1: lg(20_000).clamp(6, 12),
-            p: lg(80_000).clamp(4, 10),
+            s1: lg(env("HELEX_S1_TARGET", 10_000)).clamp(6, 13),
+            p: lg(env("HELEX_P_TARGET", 40_000)).clamp(4, 11),
         }
     }
 }
