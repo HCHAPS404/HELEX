@@ -82,8 +82,15 @@ struct CampDayAgg {
 }
 
 const ID_TAG: u64 = 1 << 63;
-const FLAG_INVALID: u8 = 1;
 const EMPTY_LOC: u32 = u32::MAX;
+
+// Invalid flag lives in bit 0 of the packed ingest field:
+// ingest = (ingest_ms << 1) | invalid — ordering is preserved, so dedup's
+// min-ingest comparisons work on the packed values directly.
+#[inline]
+fn pack_ingest(ms: i64, invalid: bool) -> i64 {
+    (ms << 1) | invalid as i64
+}
 
 // 48-byte dedup record. event_id/user_id encode to exact u64 keys when they
 // match the generator's shape (prefix byte + <=8 ASCII payload bytes):
@@ -96,15 +103,13 @@ const EMPTY_LOC: u32 = u32::MAX;
 #[derive(Clone, Copy)]
 struct EvRecord {
     key: u64,
-    ingest_ms: i64,
+    ingest: i64,
     user_key: u64,
     ev: u64,
     id_loc: u32,
     user_loc: u32,
-    flags: u8,
-    _pad: [u8; 7],
 }
-const _: () = assert!(std::mem::size_of::<EvRecord>() == 48);
+const _: () = assert!(std::mem::size_of::<EvRecord>() == 40);
 
 struct ShardBuf {
     recs: Vec<EvRecord>,
@@ -312,7 +317,7 @@ fn dedup_insert_mark(
                 }
             }
             let key = rec.key;
-            let inv = rec.flags & FLAG_INVALID != 0;
+            let inv = rec.ingest & 1 != 0;
             let mut i = (mix64(key) as usize) & tab.mask;
             loop {
                 let v = tab.vals[i];
@@ -337,7 +342,7 @@ fn dedup_insert_mark(
                             )
                     };
                     if same {
-                        if rec.ingest_ms < erec.ingest_ms {
+                        if rec.ingest < erec.ingest {
                             tab.vals[i] = pack_loc(inv, buf_idx, rec_idx);
                         }
                         break;
@@ -880,13 +885,11 @@ pub fn run_pipeline(
                     .collect::<Vec<_>>(),
                 stage: [[EvRecord {
                     key: 0,
-                    ingest_ms: 0,
+                    ingest: 0,
                     user_key: 0,
                     ev: 0,
                     id_loc: 0,
                     user_loc: 0,
-                    flags: 0,
-                    _pad: [0; 7],
                 }; 4]; NUM_SHARDS],
                 stage_n: [0; NUM_SHARDS],
             },
@@ -929,7 +932,7 @@ pub fn run_pipeline(
                 } else {
                     u32::MAX
                 };
-                let (user_key, user_loc, ev, flags) =
+                let (user_key, user_loc, ev, invalid) =
                     match validate_event_copy(fields, ingest_ms, catalog_ref) {
                         Some((user, ev)) => {
                             let (uk, slow_u) = field_key(user, b'u');
@@ -938,25 +941,23 @@ pub fn run_pipeline(
                             } else {
                                 u32::MAX
                             };
-                            (uk, ul, ev, 0)
+                            (uk, ul, ev, false)
                         }
-                        None => (0, u32::MAX, 0, FLAG_INVALID),
+                        None => (0, u32::MAX, 0, true),
                     };
                 if pl < 5 {
-                    std::hint::black_box(&(key, ingest_ms, user_key, ev, flags));
+                    std::hint::black_box(&(key, ingest_ms, user_key, ev, invalid));
                     return;
                 }
                 sc.push(
                     s_idx,
                     EvRecord {
                         key,
-                        ingest_ms,
+                        ingest: pack_ingest(ingest_ms, invalid),
                         user_key,
                         ev,
                         id_loc,
                         user_loc,
-                        flags,
-                        _pad: [0; 7],
                     },
                 );
             },
@@ -1011,7 +1012,7 @@ pub fn run_pipeline(
                 } else {
                     u32::MAX
                 };
-                let (user_key, user_loc, ev, flags) =
+                let (user_key, user_loc, ev, invalid) =
                     match validate_event_copy(fields, ingest_ms, catalog_ref) {
                         Some((user, ev)) => {
                             let (uk, slow_u) = field_key(user, b'u');
@@ -1020,19 +1021,17 @@ pub fn run_pipeline(
                             } else {
                                 u32::MAX
                             };
-                            (uk, ul, ev, 0)
+                            (uk, ul, ev, false)
                         }
-                        None => (0, u32::MAX, 0, FLAG_INVALID),
+                        None => (0, u32::MAX, 0, true),
                     };
                 let rec = EvRecord {
                     key,
-                    ingest_ms,
+                    ingest: pack_ingest(ingest_ms, invalid),
                     user_key,
                     ev,
                     id_loc,
                     user_loc,
-                    flags,
-                    _pad: [0; 7],
                 };
                 let rec_bytes: &[u8] = unsafe {
                     std::slice::from_raw_parts(
