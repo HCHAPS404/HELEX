@@ -1,8 +1,10 @@
 mod catalog;
 mod csv_dialect;
 mod dsu;
+mod mem_guard;
 mod parquet_out;
 mod pipeline;
+mod sso;
 mod timestamp;
 
 use std::env;

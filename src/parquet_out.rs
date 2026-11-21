@@ -9,13 +9,15 @@ use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use parquet::file::writer::SerializedFileWriter;
 use parquet::schema::types::Type;
 
+use crate::sso::SmallBytes;
+
 pub struct UserDailyRow {
-    pub user_id: Box<[u8]>,
+    pub user_id: SmallBytes,
     pub day: i32,
     pub sessions: i64,
     pub events: i64,
     pub revenue_cents: i64,
-    pub top_category: Option< u16 >,
+    pub top_category: Option<u16>,
 }
 
 pub struct CampaignDailyRow {
@@ -182,7 +184,7 @@ pub fn write_user_daily_part(
         cat_vals.clear();
 
         for r in chunk {
-            user_ids.push(ByteArray::from(r.user_id.to_vec()));
+            user_ids.push(ByteArray::from(r.user_id.as_slice().to_vec()));
             days.push(r.day);
             sessions.push(r.sessions);
             events.push(r.events);

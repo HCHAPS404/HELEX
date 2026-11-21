@@ -1,18 +1,22 @@
 use std::cmp::Reverse;
-use std::fs;
-use std::io;
+use std::fs::{self, File};
+use std::io::{self, BufWriter, Write};
 use std::path::Path;
 
+use hashbrown::HashTable;
 use rustc_hash::FxHashMap;
 
 use crate::catalog::Catalog;
 use crate::csv_dialect::{iter_data_lines, parse_fixed_fields, parse_price_cents};
 use crate::dsu::{csv_paths, UnionFind};
+use crate::mem_guard::should_spill_events;
 use crate::parquet_out::{
     write_campaign_daily, write_user_daily_part, CampaignDailyRow, UserDailyRow,
 };
+use crate::sso::{hash64_bytes, SmallBytes};
 use crate::timestamp::parse_timestamp;
 
+const NUM_SHARDS: usize = 256;
 const DAY_MS: i64 = 86_400_000;
 const LATE_LIMIT_MS: i64 = 86_400_000;
 const SESSION_GAP_MS: i64 = 1_800_000;
@@ -26,15 +30,10 @@ struct ValidEvent {
     cat_id: u16,
 }
 
-struct EventDedupEntry {
-    min_ingest_ts: i64,
-    payload: Option<(Box<[u8]>, ValidEvent)>,
-}
-
 #[derive(Clone)]
 struct ClickItem {
     ts: i64,
-    click_id: Box<[u8]>,
+    click_id: SmallBytes,
     camp_id: u16,
 }
 
@@ -46,13 +45,47 @@ struct CampDayAgg {
     assisted_sessions: i64,
 }
 
+struct ShardDedupSlot {
+    ev_hash: u64,
+    id_off: usize,
+    id_len: usize,
+    min_ingest_ts: i64,
+    valid_off: usize,
+}
+
+#[inline]
+fn append_shard_record(
+    buf: &mut Vec<u8>,
+    ev_hash: u64,
+    ingest_ms: i64,
+    event_id: &[u8],
+    valid: Option<(&[u8], ValidEvent)>,
+) {
+    buf.extend_from_slice(&ev_hash.to_le_bytes());
+    buf.extend_from_slice(&ingest_ms.to_le_bytes());
+    buf.extend_from_slice(&(event_id.len() as u32).to_le_bytes());
+    buf.extend_from_slice(event_id);
+    match valid {
+        None => buf.push(0u8),
+        Some((person, ev)) => {
+            buf.push(1u8);
+            buf.extend_from_slice(&(person.len() as u32).to_le_bytes());
+            buf.extend_from_slice(person);
+            buf.extend_from_slice(&ev.ts.to_le_bytes());
+            buf.extend_from_slice(&ev.price_cents.to_le_bytes());
+            let packed_cat = (ev.cat_id << 1) | u16::from(ev.is_purchase);
+            buf.extend_from_slice(&packed_cat.to_le_bytes());
+        }
+    }
+}
+
 #[inline]
 fn validate_event_copy<'a>(
     fields: [&'a [u8]; 7],
     ingest_ms: i64,
     catalog: &Catalog,
     dsu: &'a UnionFind,
-) -> Option<(Box<[u8]>, ValidEvent)> {
+) -> Option<(&'a [u8], ValidEvent)> {
     let user_raw = fields[1];
     if user_raw.is_empty() {
         return None;
@@ -73,7 +106,7 @@ fn validate_event_copy<'a>(
     if ingest_ms - ts > LATE_LIMIT_MS {
         return None;
     }
-    let person: Box<[u8]> = dsu.resolve(user_raw).into();
+    let person = dsu.resolve(user_raw);
     let cat_id = if is_purchase {
         catalog.category_of(product_raw)
     } else {
@@ -90,10 +123,128 @@ fn validate_event_copy<'a>(
     ))
 }
 
+fn dedup_one_shard(
+    shard_buf: &[u8],
+    table: &mut HashTable<usize>,
+    slots: &mut Vec<ShardDedupSlot>,
+    mut emit: impl FnMut(&[u8], ValidEvent),
+) {
+    table.clear();
+    slots.clear();
+    let mut pos = 0usize;
+    while pos < shard_buf.len() {
+        let ev_hash = u64::from_le_bytes(shard_buf[pos..pos + 8].try_into().unwrap());
+        let ingest_ms = i64::from_le_bytes(shard_buf[pos + 8..pos + 16].try_into().unwrap());
+        let id_len = u32::from_le_bytes(shard_buf[pos + 16..pos + 20].try_into().unwrap()) as usize;
+        let id_off = pos + 20;
+        let ev_id = &shard_buf[id_off..id_off + id_len];
+        pos = id_off + id_len;
+        let tag = shard_buf[pos];
+        pos += 1;
+        let valid_off = if tag == 0 {
+            usize::MAX
+        } else {
+            let v_off = pos;
+            let p_len = u32::from_le_bytes(shard_buf[pos..pos + 4].try_into().unwrap()) as usize;
+            pos += 4 + p_len + 8 + 4 + 2;
+            v_off
+        };
+
+        if let Some(&slot_idx) = table.find(ev_hash, |&idx| {
+            let s = &slots[idx];
+            s.ev_hash == ev_hash && &shard_buf[s.id_off..s.id_off + s.id_len] == ev_id
+        }) {
+            let s = &mut slots[slot_idx];
+            if ingest_ms < s.min_ingest_ts {
+                s.min_ingest_ts = ingest_ms;
+                s.valid_off = valid_off;
+            }
+        } else {
+            let idx = slots.len();
+            slots.push(ShardDedupSlot {
+                ev_hash,
+                id_off,
+                id_len,
+                min_ingest_ts: ingest_ms,
+                valid_off,
+            });
+            table.insert_unique(ev_hash, idx, |&i| slots[i].ev_hash);
+        }
+    }
+
+    for s in slots.iter() {
+        if s.valid_off != usize::MAX {
+            let mut p = s.valid_off;
+            let p_len = u32::from_le_bytes(shard_buf[p..p + 4].try_into().unwrap()) as usize;
+            p += 4;
+            let person = &shard_buf[p..p + p_len];
+            p += p_len;
+            let ts = i64::from_le_bytes(shard_buf[p..p + 8].try_into().unwrap());
+            let price_cents = u32::from_le_bytes(shard_buf[p + 8..p + 12].try_into().unwrap());
+            let packed_cat = u16::from_le_bytes(shard_buf[p + 12..p + 14].try_into().unwrap());
+            emit(
+                person,
+                ValidEvent {
+                    ts,
+                    price_cents,
+                    is_purchase: (packed_cat & 1) != 0,
+                    cat_id: packed_cat >> 1,
+                },
+            );
+        }
+    }
+}
+
+struct PersonMap {
+    table: HashTable<u32>,
+    keys: Vec<SmallBytes>,
+    events: Vec<Vec<ValidEvent>>,
+    clicks: Vec<Vec<ClickItem>>,
+}
+
+impl PersonMap {
+    fn with_capacity(cap: usize) -> Self {
+        Self {
+            table: HashTable::with_capacity(cap),
+            keys: Vec::with_capacity(cap),
+            events: Vec::with_capacity(cap),
+            clicks: Vec::with_capacity(cap),
+        }
+    }
+
+    #[inline]
+    fn push_event(&mut self, person: &[u8], ev: ValidEvent) {
+        let h = hash64_bytes(person);
+        let keys = &self.keys;
+        if let Some(&idx) = self.table.find(h, |&i| keys[i as usize].eq_slice(person)) {
+            self.events[idx as usize].push(ev);
+        } else {
+            let idx = self.keys.len() as u32;
+            self.keys.push(SmallBytes::from_slice(person));
+            self.events.push(vec![ev]);
+            self.clicks.push(Vec::new());
+            let keys = &self.keys;
+            self.table
+                .insert_unique(h, idx, |&i| keys[i as usize].hash64());
+        }
+    }
+
+    #[inline]
+    fn find_active_person(&self, person: &[u8]) -> Option<u32> {
+        if self.keys.is_empty() {
+            return None;
+        }
+        let h = hash64_bytes(person);
+        self.table
+            .find(h, |&i| self.keys[i as usize].eq_slice(person))
+            .copied()
+    }
+}
+
 pub fn run_pipeline(
     data_dir: &Path,
     out_dir: &Path,
-    _scratch_dir: &Path,
+    scratch_dir: &Path,
     debug_bench: bool,
 ) -> io::Result<()> {
     let t0 = std::time::Instant::now();
@@ -110,56 +261,107 @@ pub fn run_pipeline(
         .iter()
         .filter_map(|p| p.metadata().ok().map(|m| m.len()))
         .sum();
+    let spill = should_spill_events(total_event_bytes);
     let est_events = ((total_event_bytes / 68) as usize).max(16);
-    let mut event_dedup: FxHashMap<Box<[u8]>, EventDedupEntry> =
-        FxHashMap::with_capacity_and_hasher(est_events, Default::default());
+    let est_people = (est_events / 24).max(16);
 
-    for path in event_paths {
-        let bytes = fs::read(path)?;
-        iter_data_lines(&bytes, |line| {
-            let Some(fields) = parse_fixed_fields::<7>(line) else {
-                return;
-            };
-            let event_id = fields[0];
-            if event_id.is_empty() {
-                return;
-            }
-            let Some(ingest_ms) = parse_timestamp(fields[3]) else {
-                return;
-            };
-            if let Some(entry) = event_dedup.get_mut(event_id) {
-                if ingest_ms < entry.min_ingest_ts {
-                    entry.min_ingest_ts = ingest_ms;
-                    entry.payload = validate_event_copy(fields, ingest_ms, &catalog, &dsu);
+    let mut people = PersonMap::with_capacity(est_people);
+    let mut dedup_table: HashTable<usize> =
+        HashTable::with_capacity((est_events / NUM_SHARDS * 2).max(64));
+    let mut dedup_slots: Vec<ShardDedupSlot> =
+        Vec::with_capacity((est_events / NUM_SHARDS + 64).max(64));
+
+    if !spill {
+        let per_shard_bytes = ((total_event_bytes as usize) / NUM_SHARDS / 2).max(256);
+        let mut ram_shards: Vec<Vec<u8>> = (0..NUM_SHARDS)
+            .map(|_| Vec::with_capacity(per_shard_bytes))
+            .collect();
+
+        for path in event_paths {
+            let bytes = fs::read(path)?;
+            iter_data_lines(&bytes, |line| {
+                let Some(fields) = parse_fixed_fields::<7>(line) else {
+                    return;
+                };
+                let event_id = fields[0];
+                if event_id.is_empty() {
+                    return;
                 }
-            } else {
-                let payload = validate_event_copy(fields, ingest_ms, &catalog, &dsu);
-                event_dedup.insert(
-                    event_id.into(),
-                    EventDedupEntry {
-                        min_ingest_ts: ingest_ms,
-                        payload,
-                    },
-                );
-            }
-        });
-    }
-
-    let mut person_events: FxHashMap<Box<[u8]>, Vec<ValidEvent>> =
-        FxHashMap::with_capacity_and_hasher(event_dedup.len() / 16 + 64, Default::default());
-    for (_, entry) in event_dedup {
-        if let Some((person, ev)) = entry.payload {
-            person_events.entry(person).or_default().push(ev);
+                let Some(ingest_ms) = parse_timestamp(fields[3]) else {
+                    return;
+                };
+                let ev_hash = hash64_bytes(event_id);
+                let shard = (ev_hash >> 56) as usize;
+                let valid = validate_event_copy(fields, ingest_ms, &catalog, &dsu);
+                append_shard_record(&mut ram_shards[shard], ev_hash, ingest_ms, event_id, valid);
+            });
         }
+
+        for shard in &mut ram_shards {
+            let buf = std::mem::take(shard);
+            if !buf.is_empty() {
+                dedup_one_shard(&buf, &mut dedup_table, &mut dedup_slots, |person, ev| {
+                    people.push_event(person, ev);
+                });
+            }
+        }
+    } else {
+        let spill_dir = scratch_dir.join("helex_ev_shards");
+        let _ = fs::remove_dir_all(&spill_dir);
+        fs::create_dir_all(&spill_dir)?;
+        let mut writers: Vec<BufWriter<File>> = (0..NUM_SHARDS)
+            .map(|s| {
+                File::create(spill_dir.join(format!("s{s:03}.bin")))
+                    .map(|f| BufWriter::with_capacity(32 * 1024, f))
+            })
+            .collect::<io::Result<_>>()?;
+        let mut tmp_rec = Vec::with_capacity(128);
+
+        for path in event_paths {
+            let bytes = fs::read(path)?;
+            iter_data_lines(&bytes, |line| {
+                let Some(fields) = parse_fixed_fields::<7>(line) else {
+                    return;
+                };
+                let event_id = fields[0];
+                if event_id.is_empty() {
+                    return;
+                }
+                let Some(ingest_ms) = parse_timestamp(fields[3]) else {
+                    return;
+                };
+                let ev_hash = hash64_bytes(event_id);
+                let shard = (ev_hash >> 56) as usize;
+                let valid = validate_event_copy(fields, ingest_ms, &catalog, &dsu);
+                tmp_rec.clear();
+                append_shard_record(&mut tmp_rec, ev_hash, ingest_ms, event_id, valid);
+                writers[shard].write_all(&tmp_rec).expect("spill write failed");
+            });
+        }
+        for mut w in writers {
+            w.flush()?;
+        }
+
+        for s in 0..NUM_SHARDS {
+            let p = spill_dir.join(format!("s{s:03}.bin"));
+            let bytes = fs::read(&p)?;
+            let _ = fs::remove_file(&p);
+            if !bytes.is_empty() {
+                dedup_one_shard(&bytes, &mut dedup_table, &mut dedup_slots, |person, ev| {
+                    people.push_event(person, ev);
+                });
+            }
+        }
+        let _ = fs::remove_dir_all(&spill_dir);
     }
+    drop(dedup_table);
+    drop(dedup_slots);
     let t_events = t2.elapsed();
 
     let t3 = std::time::Instant::now();
     let click_min_ts = catalog.window_start - CLICK_REACH_MS;
-    let mut person_clicks: FxHashMap<Box<[u8]>, Vec<ClickItem>> =
-        FxHashMap::with_capacity_and_hasher(person_events.len(), Default::default());
 
-    if !person_events.is_empty() {
+    if !people.keys.is_empty() {
         for path in csv_paths(&data_dir.join("clicks")) {
             let bytes = fs::read(path)?;
             iter_data_lines(&bytes, |line| {
@@ -172,9 +374,9 @@ pub fn run_pipeline(
                     return;
                 }
                 let person = dsu.resolve(user_raw);
-                if !person_events.contains_key(person) {
+                let Some(p_idx) = people.find_active_person(person) else {
                     return;
-                }
+                };
                 let Some(camp_id) = catalog.campaign_of(fields[2]) else {
                     return;
                 };
@@ -184,14 +386,11 @@ pub fn run_pipeline(
                 if ts < click_min_ts || ts >= catalog.window_end {
                     return;
                 }
-                person_clicks
-                    .entry(person.into())
-                    .or_default()
-                    .push(ClickItem {
-                        ts,
-                        click_id: click_id.into(),
-                        camp_id,
-                    });
+                people.clicks[p_idx as usize].push(ClickItem {
+                    ts,
+                    click_id: SmallBytes::from_slice(click_id),
+                    camp_id,
+                });
             });
         }
     }
@@ -203,19 +402,24 @@ pub fn run_pipeline(
     let mut camp_daily_map: FxHashMap<(u16, i32), CampDayAgg> =
         FxHashMap::with_capacity_and_hasher(num_camps_with_org * 16, Default::default());
 
-    let mut user_rows: Vec<UserDailyRow> = Vec::with_capacity(person_events.len() * 4);
+    let mut user_rows: Vec<UserDailyRow> = Vec::with_capacity(people.keys.len() * 4);
     let mut camp_counts = vec![0u32; num_camps_with_org];
     let mut in_active = vec![false; num_camps_with_org];
     let mut active_camps: Vec<u16> = Vec::with_capacity(64);
     let mut day_cat_rev = vec![0u64; num_cats];
 
-    for (person, mut evs) in person_events {
+    for ((person, mut evs), mut clicks) in people
+        .keys
+        .into_iter()
+        .zip(people.events)
+        .zip(people.clicks)
+    {
         evs.sort_unstable_by_key(|e| e.ts);
 
-        let mut clicks = person_clicks.remove(&person).unwrap_or_default();
         if !clicks.is_empty() {
             clicks.sort_unstable_by(|a, b| {
-                a.ts.cmp(&b.ts).then_with(|| Reverse(&a.click_id).cmp(&Reverse(&b.click_id)))
+                a.ts.cmp(&b.ts)
+                    .then_with(|| Reverse(&a.click_id).cmp(&Reverse(&b.click_id)))
             });
             clicks.dedup_by(|a, b| a.ts == b.ts && a.click_id == b.click_id);
         }
@@ -375,7 +579,11 @@ pub fn run_pipeline(
     let t5 = std::time::Instant::now();
     let user_dir = out_dir.join("user_daily");
     fs::create_dir_all(&user_dir)?;
-    write_user_daily_part(&user_dir.join("part-0.parquet"), &user_rows, &catalog.categories)?;
+    write_user_daily_part(
+        &user_dir.join("part-0.parquet"),
+        &user_rows,
+        &catalog.categories,
+    )?;
 
     let mut camp_rows: Vec<CampaignDailyRow> = Vec::with_capacity(camp_daily_map.len());
     for ((cid, day), agg) in camp_daily_map {
@@ -396,7 +604,8 @@ pub fn run_pipeline(
 
     if debug_bench {
         eprintln!(
-            "[DEBUG_BENCH] cat={:.3}s dsu={:.3}s events={:.3}s clicks={:.3}s sess={:.3}s parquet={:.3}s total={:.3}s (user_rows={}, camp_rows={})",
+            "[DEBUG_BENCH] spill={} cat={:.3}s dsu={:.3}s events={:.3}s clicks={:.3}s sess={:.3}s parquet={:.3}s total={:.3}s (user_rows={}, camp_rows={})",
+            spill,
             t_cat.as_secs_f64(),
             t_dsu.as_secs_f64(),
             t_events.as_secs_f64(),
@@ -465,4 +674,3 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 }
-

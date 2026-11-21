@@ -2,13 +2,14 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use rustc_hash::FxHashMap;
+use hashbrown::HashTable;
 
 use crate::csv_dialect::{iter_data_lines, parse_fixed_fields};
+use crate::sso::{hash64_bytes, SmallBytes};
 
 pub struct UnionFind {
-    ids: FxHashMap<Box<[u8]>, u32>,
-    strings: Vec<Box<[u8]>>,
+    table: HashTable<u32>,
+    strings: Vec<SmallBytes>,
     parent: Vec<u32>,
     size: Vec<u32>,
     min_id_idx: Vec<u32>,
@@ -17,7 +18,7 @@ pub struct UnionFind {
 impl UnionFind {
     pub fn with_capacity(cap: usize) -> Self {
         Self {
-            ids: FxHashMap::with_capacity_and_hasher(cap, Default::default()),
+            table: HashTable::with_capacity(cap),
             strings: Vec::with_capacity(cap),
             parent: Vec::with_capacity(cap),
             size: Vec::with_capacity(cap),
@@ -27,16 +28,22 @@ impl UnionFind {
 
     #[inline]
     pub fn intern(&mut self, s: &[u8]) -> u32 {
-        if let Some(&idx) = self.ids.get(s) {
+        let hash = hash64_bytes(s);
+        let strings = &self.strings;
+        if let Some(&idx) = self
+            .table
+            .find(hash, |&idx| strings[idx as usize].eq_slice(s))
+        {
             return idx;
         }
         let idx = self.strings.len() as u32;
-        let boxed: Box<[u8]> = s.into();
-        self.ids.insert(boxed.clone(), idx);
-        self.strings.push(boxed);
+        self.strings.push(SmallBytes::from_slice(s));
         self.parent.push(idx);
         self.size.push(1);
         self.min_id_idx.push(idx);
+        let strings = &self.strings;
+        self.table
+            .insert_unique(hash, idx, |&i| strings[i as usize].hash64());
         idx
     }
 
@@ -90,9 +97,16 @@ impl UnionFind {
 
     #[inline]
     pub fn resolve<'a>(&'a self, raw_id: &'a [u8]) -> &'a [u8] {
-        if let Some(&idx) = self.ids.get(raw_id) {
+        if self.strings.is_empty() {
+            return raw_id;
+        }
+        let hash = hash64_bytes(raw_id);
+        if let Some(&idx) = self
+            .table
+            .find(hash, |&i| self.strings[i as usize].eq_slice(raw_id))
+        {
             let min_idx = self.min_id_idx[idx as usize];
-            &self.strings[min_idx as usize]
+            self.strings[min_idx as usize].as_slice()
         } else {
             raw_id
         }
@@ -113,7 +127,10 @@ pub fn csv_paths(folder: &Path) -> Vec<PathBuf> {
 
 pub fn load_links(data_dir: &Path) -> io::Result<UnionFind> {
     let paths = csv_paths(&data_dir.join("links"));
-    let total_bytes: u64 = paths.iter().filter_map(|p| p.metadata().ok().map(|m| m.len())).sum();
+    let total_bytes: u64 = paths
+        .iter()
+        .filter_map(|p| p.metadata().ok().map(|m| m.len()))
+        .sum();
     let est_ids = ((total_bytes / 12) as usize).clamp(16, 4_000_000);
     let mut uf = UnionFind::with_capacity(est_ids);
     for path in paths {
