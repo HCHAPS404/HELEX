@@ -13,3 +13,16 @@ Hardware oficial del evaluador: GCP `n2` Intel Xeon (`linux/amd64`), 8 vCPUs, 24
 | Hito 3B (5M events nativo) | Dev generado seed 7, 5M events / 1.25M clicks, 12 hilos nativo Windows (host con ~2 GB libres) | Invariantes OK (571,890 user_rows / 28,014 camp_rows) | — | ~1.575 s (5M) | ~28 s (60M, extrap. lineal) | ~700 MB | `cat=0.009s dsu=0.101s events=1.028s clicks=0.124s sess=0.136s parquet=0.177s` |
 | **Hito 3C-A Modal 20M** (seed 3) | Modal `cpu=8.0, mem=24 GB` — entorno equivalente al scorer (linux/amd64, NVMe) | 5/5 invariantes contables OK (2,255,788 / 28,014 filas) | — | **2.719 s (20M, wall)** | — | n/d | `threads=8 events=1.839s clicks=0.257s sess=0.245s parquet=0.131s dsu=0.100s` |
 | **Hito 3C-A Modal 60M** (seed 5) | Modal `cpu=8.0, mem=24 GB` — réplica del final | 5/5 invariantes OK (6,685,516 / 28,014 filas), rc=0, sin OOM | — | — | **9.982 s (60M, wall)** | n/d | `threads=8 events=6.722s clicks=1.034s sess=0.774s parquet=0.235s dsu=0.711s` |
+
+## Post-submission optimization waves (HCHAPS404-DEVELOP, commits f633c14..ce34dd0)
+
+| Run | Modal 20M wall | Internal breakdown |
+|---|---|---|
+| Submitted 6591936 (baseline) | 2.72 s | events=1.84 clicks=0.26 sess=0.25 parquet=0.13 dsu=0.10 |
+| Wave1-3 seed 3 run A | 4.16 s | (noisy node - dsu 4x inflated) |
+| Wave1-3 seed 3 run B | 2.38 s | events=1.65 clicks=0.27 sess=0.18 parquet=0.10 dsu=0.10 |
+| Wave1-3 + reserve seed 4 | 3.09 s | events=2.11 clicks=0.41 sess=0.21 parquet=0.06 dsu=0.20 |
+
+Modal shared-node variance is +/-40%; treated as range ~2.4-3.1 s.
+Official practice score for the 2.72 s baseline was 3.60 s (calibration:
+official ~= 0.22 + 1.24 * modal_wall). Current waves project ~3.0-3.4 s.
