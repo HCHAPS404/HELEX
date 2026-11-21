@@ -1,7 +1,7 @@
 use std::env;
 use std::fs::File;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -20,63 +20,19 @@ pub fn worker_count() -> usize {
         .clamp(1, 64)
 }
 
-#[cfg(unix)]
-fn read_range_into(file: &File, _path: &Path, mut offset: u64, mut len: usize, out: &mut Vec<u8>) -> io::Result<()> {
-    use std::os::unix::fs::FileExt;
-    let base = out.len();
-    out.resize(base + len, 0);
-    let mut dst = &mut out[base..];
-    while !dst.is_empty() {
-        let n = file.read_at(dst, offset)?;
-        if n == 0 {
-            let read_so_far = len - dst.len();
-            out.truncate(base + read_so_far);
-            break;
-        }
-        offset += n as u64;
-        len -= n;
-        let _ = len;
-        dst = &mut dst[n..];
-    }
-    Ok(())
-}
 
-#[cfg(not(unix))]
-fn read_range_into(_file: &File, path: &Path, offset: u64, len: usize, out: &mut Vec<u8>) -> io::Result<()> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut f = File::open(path)?;
-    f.seek(SeekFrom::Start(offset))?;
-    let base = out.len();
-    out.resize(base + len, 0);
-    let mut filled = 0usize;
-    while filled < len {
-        let n = f.read(&mut out[base + filled..base + len])?;
-        if n == 0 {
-            break;
-        }
-        filled += n;
-    }
-    out.truncate(base + filled);
-    Ok(())
-}
 
-fn find_data_start(file: &File, path: &Path, file_len: u64) -> io::Result<Option<u64>> {
-    let mut probe = Vec::with_capacity(4096);
-    let mut offset = 0u64;
-    while offset < file_len {
-        probe.clear();
-        let step = 4096usize.min((file_len - offset) as usize);
-        read_range_into(file, path, offset, step, &mut probe)?;
-        if probe.is_empty() {
-            return Ok(None);
+fn find_data_start(map: &[u8], file_len: u64) -> Option<u64> {
+    let mut offset = 0usize;
+    while offset < map.len() {
+        let step = 4096usize.min(map.len() - offset);
+        if let Some(pos) = memchr::memchr(b'\n', &map[offset..offset + step]) {
+            let start = offset as u64 + pos as u64 + 1;
+            return (start < file_len).then_some(start);
         }
-        if let Some(pos) = memchr::memchr(b'\n', &probe) {
-            let start = offset + pos as u64 + 1;
-            return Ok((start < file_len).then_some(start));
-        }
-        offset += probe.len() as u64;
+        offset += step;
     }
-    Ok(None)
+    None
 }
 
 pub fn parallel_for<F>(count: usize, threads: usize, f: F)
@@ -103,8 +59,7 @@ where
 }
 
 struct ChunkTask {
-    file: Arc<File>,
-    path: Arc<PathBuf>,
+    map: Arc<memmap2::Mmap>,
     file_len: u64,
     data_start: u64,
     c_start: u64,
@@ -134,17 +89,16 @@ where
 
     let mut tasks: Vec<ChunkTask> = Vec::with_capacity(sized_paths.len() * 2);
     for (file_len, p) in sized_paths {
-        let file = Arc::new(File::open(p)?);
-        let Some(data_start) = find_data_start(&file, p, file_len)? else {
+        let file = File::open(p)?;
+        let map = Arc::new(unsafe { memmap2::Mmap::map(&file)? });
+        let Some(data_start) = find_data_start(&map, file_len) else {
             continue;
         };
-        let path_arc = Arc::new(p.clone());
         let mut c_start = data_start;
         while c_start < file_len {
             let c_end = (c_start + block_size).min(file_len);
             tasks.push(ChunkTask {
-                file: Arc::clone(&file),
-                path: Arc::clone(&path_arc),
+                map: Arc::clone(&map),
                 file_len,
                 data_start,
                 c_start,
@@ -174,14 +128,13 @@ where
 
             scope.spawn(move || {
                 let mut state = init_ref(worker_id);
-                let mut buf = Vec::with_capacity(block_size as usize + 8192);
 
                 loop {
                     let idx = next_ref.fetch_add(1, Ordering::Relaxed);
                     let Some(task) = tasks_ref.get(idx) else {
                         break;
                     };
-                    if let Err(e) = execute_chunk(task, &mut buf, &mut state, line_ref) {
+                    if let Err(e) = execute_chunk(task, &mut state, line_ref) {
                         let mut guard = err_ref.lock().unwrap();
                         if guard.is_none() {
                             *guard = Some(e);
@@ -206,40 +159,27 @@ where
 
 fn execute_chunk<S, LineFn>(
     task: &ChunkTask,
-    buf: &mut Vec<u8>,
     state: &mut S,
     process_line: &LineFn,
 ) -> io::Result<()>
 where
     LineFn: Fn(&mut S, &[u8], bool),
 {
+    let map = &task.map[..];
     let read_from = if task.c_start == task.data_start {
         task.c_start
     } else {
         task.c_start - 1
     };
     let mut read_to = (task.c_end + 4096).min(task.file_len);
-    buf.clear();
-    read_range_into(
-        &task.file,
-        &task.path,
-        read_from,
-        (read_to - read_from) as usize,
-        buf,
-    )?;
-
     let limit_in_buf = (task.c_end - read_from) as usize;
-    while read_to < task.file_len && memchr::memchr(b'\n', &buf[limit_in_buf..]).is_none() {
-        let next_to = (read_to + 65_536).min(task.file_len);
-        read_range_into(
-            &task.file,
-            &task.path,
-            read_to,
-            (next_to - read_to) as usize,
-            buf,
-        )?;
-        read_to = next_to;
+    while read_to < task.file_len
+        && memchr::memchr(b'\n', &map[(read_from as usize + limit_in_buf)..read_to as usize])
+            .is_none()
+    {
+        read_to = (read_to + 65_536).min(task.file_len);
     }
+    let buf = &map[read_from as usize..read_to as usize];
 
     let chunk_ascii = buf.is_ascii();
 

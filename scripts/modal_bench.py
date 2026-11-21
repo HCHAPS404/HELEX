@@ -81,6 +81,16 @@ def bench(seed: int, events: int, clicks: int) -> dict:
         except Exception:
             pass
 
+    # Drop page cache on /data so CSV reads hit disk like the scorer's cold start.
+    for root, _, files in os.walk("/data"):
+        for fn in files:
+            try:
+                fd = os.open(os.path.join(root, fn), os.O_RDONLY)
+                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                os.close(fd)
+            except OSError:
+                pass
+
     t1 = time.perf_counter()
     proc = subprocess.Popen(
         ["shopping-sessions"], env=env,
