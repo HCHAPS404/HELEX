@@ -1,8 +1,9 @@
+mod arena;
 mod catalog;
 mod csv_dialect;
+mod csv_scan;
 mod dsu;
-mod io_pool;
-mod mem_guard;
+mod keys;
 mod parquet_out;
 mod pipeline;
 mod sso;

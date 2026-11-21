@@ -1,120 +1,99 @@
 # HELEX — Shopping Sessions 4 (Rust engine)
 
-Implementación nativa en Rust del benchmark `shopping-sessions-4`. Reemplaza
-el baseline PySpark (~172s) por un pipeline de un solo paso en Rust.
+Implementación nativa en Rust del benchmark `shopping-sessions-4` (reto
+Databricks del Builders Buildathon). Reemplaza el baseline PySpark (~172 s).
 
-**Score oficial actual: 2.75s** (leaderboard conserva el mejor envío).
+**Score oficial vigente: 2.75 s** (motor anterior, commit `ead4d6c`). Este
+README describe el motor reescrito en la rama `claude/admiring-knuth-sv8e8w`; su objetivo es
+bajar de 1.5 s en el scorer oficial. Aún no tiene score oficial.
 
-## Estado del repo
+## Arquitectura (`src/pipeline.rs`)
 
-| Rama | Contenido |
-|---|---|
-| `main` | Merge estable del motor (este estado) |
-| `HCHAPS404-DEVELOP` | Rama de desarrollo activa (trabajo de optimización) |
-| `dsu-integration` | Trabajo original del equipo (DSU/links) — preservada |
+1. `catalog.rs`: ventana del manifest, productos/categorías y campañas.
+2. `keys.rs`: claves `u64` exactas para IDs cortos (`prefijo + ≤8 bytes`, o
+   `≤8 bytes`). Los IDs largos o no ASCII usan `0xFF<<56 | hash56` y un
+   registro de bytes para recuperarlos en la salida.
+3. `dsu.rs`: links → persona canónica (union-find sobre claves `u64`, gana el
+   ID byte a byte menor), más un filtro de bits que evita la búsqueda para
+   usuarios sin links.
+4. **Fase 1 (parseo)**: los archivos se cortan en chunks de 256 KiB
+   (`mmap` + `MADV_POPULATE_READ`; `pread` en las colas de archivo).
+   `csv_scan.rs` arma en un pasada AVX2 los bitmaps de `\n` `,` `"` del
+   chunk, y los campos se leen de ventanas de 128 bits. Las líneas con
+   comillas caen al splitter genérico exacto. Timestamps F1 con SWAR.
+   - Eventos → `EvRec` de 32 B (`key, ingest, user, ev`) repartidos por shard
+     de `event_id`.
+   - Clicks → resueltos a persona canónica, `CkRec` repartidos por partición
+     de persona.
+5. `arena.rs`: los registros van a bloques de 16 KiB de una arena mmap con THP.
+   Nada de realloc/memmove, y los bloques consumidos se reciclan en la fase
+   siguiente para no poner a cero memoria nueva.
+6. **Fase 2 (dedup)**: por shard (~10k registros), tabla open-addressing
+   intercalada `[key, addr]` en L2. Gana el menor `ingest` (con inválidos).
+   Los ganadores se emiten releyendo los registros en orden secuencial como
+   `(persona, ev)` de 16 B, repartidos por partición de persona.
+7. **Fase 3 (sesiones)**: por partición (~40k registros), counting sort por
+   persona, sesionización, atribución de clicks y agregados por campaña/día.
+   `user_daily` se escribe en streaming (un row group por bloque de ~64k
+   filas, un archivo por worker).
+8. `parquet_out.rs`: Parquet sin compresión, sin diccionario, sin stats.
 
-Mejor commit medido en el scorer: `ead4d6c` (= contenido de `9cf82d4`/`1004df9`
-más cambios neutros posteriores).
+Los conteos de shards y particiones escalan con el tamaño de la entrada
+(`HELEX_S1_TARGET`, `HELEX_P_TARGET`). Otras perillas para A/B:
+`HELEX_IO=pread`, `HELEX_THP=0`, `HELEX_CHUNK_KB`, `NCPU`.
 
-## Arquitectura (pipeline, `src/pipeline.rs`)
+## Build / Docker
 
-1. `catalog.rs` — ventana temporal + catálogo/categorías.
-2. `dsu.rs` — links usuario→persona canónica (union-find, ID lexicográfico menor).
-3. `io_pool.rs` — pool de workers que lee CSVs con `mmap` (orden LPT por tamaño,
-   `MADV_SEQUENTIAL`/`WILLNEED`).
-4. `csv_dialect.rs` — splitter de líneas/campos con ruta **AVX2** de 3 máscaras
-   (detección runtime; fallback escalar para x86-64-v2).
-5. `timestamp.rs` — parser F1/F2/F3 con LUT de días-epoch.
-6. Eventos: parse → `EvRecord` de **48B** con claves `u64` inline
-   (`field_key`: `'e'+len<=9` y `'u'+len<=9` caben en u64 big-endian con tag;
-   el resto va a arena lateral + hash64).
-7. Dedup global por `event_id`: `DedupTab` open-addressing (u64→loc) por shard;
-   gana el copy con menor `ingest_ms` (incluido si es inválido).
-   `win_bits` bitmap marca ganadores; el barrido posterior es **secuencial**.
-8. Interning denso: `user_key → person_idx` vía `UMap` (open-addressing u64)
-   construido una sola vez; clicks con fallback DSU para usuarios click-only.
-9. `Rec12` (16B: person_idx|ev) → particiones densas por persona;
-   `Vec<Vec<u64>>` indexado por `person_idx`, sin hashing en sesión.
-10. `parquet_out.rs` — salida Parquet sin compresión, sin dict, sin stats.
+El binario se compila **estático con glibc** (`+crt-static`) y corre
+`FROM scratch`. musl salió ~15 % más lento por su `memcpy`/`memset`.
+
+```bash
+cargo build --release
+make build          # imagen docker linux/amd64
+```
 
 ## Verificación (obligatoria tras cada cambio)
 
 ```bash
-cargo test --release                                        # 8/8
+cargo test --release
 uv run --with polars python scripts/run_fixtures.py fixtures -- target/release/shopping-sessions   # 36/36
-uv run --with polars python scripts/verify_seeds.py --bin target/release/shopping-sessions \
-  --generate generator_extracted/generator/target/release/generate.exe \
-  --dev <dev-1M-dir> --answer dev-answer                    # bit-exact
 ```
 
-Modal 20M (nodo similar al scorer):
-`cd scripts && GEN_DIR=../generator_extracted/generator uv run --with modal modal run modal_bench.py`
+Datos sintéticos para medir y comparar (A/B de salida entre dos binarios):
 
-Telemetría: el binario imprime `[bench] ... avx2={0|1} cat dsu ingest dedup
-ins_cpu map emit_cpu clicks cres events sess parquet total` a stderr
-**incondicionalmente** — visible en los logs del scorer.
+```bash
+cargo build --release --manifest-path tools/synthgen/Cargo.toml
+tools/synthgen/target/release/synthgen /tmp/d20 20000000 5000000 3
+SYNTH_EDGE=1 tools/synthgen/target/release/synthgen /tmp/dedge 3000000 1500000 11   # IDs largos/UTF-8, click ids largos, empates
+DATA_DIR=/tmp/d20 OUTPUT_DIR=/tmp/out_a ./bin_a; DATA_DIR=/tmp/d20 OUTPUT_DIR=/tmp/out_b ./bin_b
+uv run --with polars python scripts/compare.py /tmp/out_a /tmp/out_b
+```
 
-## Historial de resultados (scorer oficial)
+`synthgen` **no** es el generador oficial: aproxima su forma (tamaños,
+duplicados, inválidos, formatos de timestamp, links, clicks) y sirve solo para
+medir tiempos y comparar salidas entre builds, no como verdad de referencia.
 
-| Commit | Cambio | Modal | Oficial |
-|---|---|---|---|
-| `6591936` | motor base | ~2.6s | 3.60 |
-| `d1dd8ed` | mejoras varias | ~2.5s | 3.49 |
-| `4dcd362` | dsu overlap | ~2.1s | 3.35 |
-| `647f931` | AVX2 3-máscaras CSV | 1.59s | 3.31 |
-| `ca615d9` | records 48B + tabla u64 | 1.58s | 3.33 |
-| `5783ec2` | split hot/cold (REVERTIDO) | 1.69s | **2.94 ❌** |
-| `ead4d6c` | bitmap secuencial + staging + fusión collect→insert | ~1.66s | **2.75 ✅** |
-| `9cf82d4` | revert hot/cold (= `ead4d6c` semánticamente) | — | — |
-| `1004df9` | + prefetch de slots dedup | — | candidato |
-
-## Lo que el scorer premia / penaliza (¡importante, Alex!)
-
-El hardware del scorer es mucho más sensible a **patrones de acceso a memoria**
-que a CPU pura:
-
-✅ **Premia**: una sola corriente secuencial por pasada, bitmaps en vez de
-accesos aleatorios, writes en bloques (staging), menos sweeps sobre DRAM.
-
-❌ **Penaliza**: streams intercalados (el split hot/cold 24B+24B leía
-hot[i]+cold[i] por iteración = 2 streams: −0.19s **peor** pese a tocar menos
-bytes), más RSS/páginas comprometidas.
-
-## NO hacer (ya medido, no reintentar)
-
-- **Dedup con CAS/atómicos globales** — ~2.7× más lento (`f3a2b08`).
-- **Zero-copy sobre mmap con punteros** — TLB thrashing, peor.
-- **Bitmap compartido entre threads para dedup** — contención + bugs de
-  corrección.
-- **musl para ganar velocidad** — A/B real: musl no es el cuello (musl 6.7s vs
-  glibc 8.7s en el mismo host; el scorer corre musl pero eso no es el problema).
-- **Split hot/cold de records** — medido: 2.94 (peor que 2.75). Ver arriba.
-- **Dedup por usuario/persona antes del dedup global por event_id** — rompe
-  reglas: el dedup es global por `event_id` y el copy ganador es el de menor
-  `ingest_ms` aunque sea inválido.
-- **Asumir que usuarios de clicks aparecen en events** — hay click-only users;
-  requiere fallback DSU (bug real en `696c55f`, ya corregido).
-- **Segunda pasada radix** — medido sin beneficio.
-- **`gather` AVX2 (vpgatherqq)** para probes — microcode lento, no compensa.
+Telemetría: el binario imprime a stderr
+`[bench] threads cat dsu parse dedup sess out total user_rows camp_rows`.
 
 ## Reglas de corrección intocables
 
-- Dedup global por `event_id`, gana el menor `ingest_ms` (incluso inválidos).
-- Persona canónica = menor ID lexicográfico (bytes) del conjunto linkado.
-- Usuarios click-only resuelven vía DSU.
-- Spill a `/scratch` debe seguir funcionando a 60M eventos (guardar RAM<24GB).
-- stdout vacío siempre; telemetría solo a stderr.
+- Dedup global por `event_id`: gana el menor `ingest_ms`, aunque sea inválido.
+- Persona canónica = menor ID (bytes) del conjunto linkado.
+- Usuarios que solo aparecen en clicks resuelven vía DSU.
+- 60M eventos deben correr en <24 GB (el motor nuevo usa ~0.5× los bytes
+  del CSV en memoria anónima).
+- stdout vacío; telemetría solo a stderr.
 
-## Cola de optimización (siguientes candidatos)
+## Lecciones del scorer (motor anterior)
 
-1. ukey open-set por u-shard (elimina collect de ~19.4M pushes + sort, ~300MB).
-2. PGO en Dockerfile (profile-generate → run → profile-use).
-3. `NUM_SHARDS` A/B (menos streams de escritura).
-4. SWAR en parse de timestamps.
-5. Recalibrar `should_spill_events` al layout actual (RSS ~10.8GB a 20M).
+El hardware del scorer es mucho más sensible a **patrones de acceso a memoria**
+y a la memoria nueva tocada que a la CPU pura. Premia una sola corriente
+secuencial por pasada y menos RSS. Castiga los streams intercalados y la
+memoria comprometida de más. El motor nuevo baja el RSS anónimo de ~4.8 GB a
+~1.2 GB en 20M eventos.
 
-Plan completo por etapas: ver `BENCHMARKS.md` y el historial de commits de
-`HCHAPS404-DEVELOP` (mensajes documentan cada experimento y su resultado).
+Historial completo de mediciones: `BENCHMARKS.md`.
 
 ---
 

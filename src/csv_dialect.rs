@@ -241,10 +241,22 @@ mod tests {
 
     #[test]
     fn csv_dialect_traps() {
-        assert_eq!(parse_fixed_fields::<2>(b"\"u1\",\"u2\"\n"), Some([&b"u1"[..], &b"u2"[..]]));
-        assert_eq!(parse_fixed_fields::<2>(b"\"\",u2\n"), Some([&b""[..], &b"u2"[..]]));
-        assert_eq!(parse_fixed_fields::<2>(b" u1,\" u1\"\n"), Some([&b" u1"[..], &b" u1"[..]]));
-        assert_eq!(parse_fixed_fields::<2>(b"u1\r,u2\r\n"), Some([&b"u1\r"[..], &b"u2\r"[..]]));
+        assert_eq!(
+            parse_fixed_fields::<2>(b"\"u1\",\"u2\"\n"),
+            Some([&b"u1"[..], &b"u2"[..]])
+        );
+        assert_eq!(
+            parse_fixed_fields::<2>(b"\"\",u2\n"),
+            Some([&b""[..], &b"u2"[..]])
+        );
+        assert_eq!(
+            parse_fixed_fields::<2>(b" u1,\" u1\"\n"),
+            Some([&b" u1"[..], &b" u1"[..]])
+        );
+        assert_eq!(
+            parse_fixed_fields::<2>(b"u1\r,u2\r\n"),
+            Some([&b"u1\r"[..], &b"u2\r"[..]])
+        );
         assert_eq!(parse_fixed_fields::<2>(b"\n"), None);
         assert_eq!(parse_fixed_fields::<2>(b""), None);
         assert_eq!(parse_fixed_fields::<2>(b"u1,u2,u3\n"), None);

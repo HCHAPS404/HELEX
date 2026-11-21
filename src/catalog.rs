@@ -131,11 +131,20 @@ impl Catalog {
         })
     }
 
+    pub fn products(&self) -> impl Iterator<Item = (&[u8], u16)> + '_ {
+        self.product_keys
+            .iter()
+            .zip(self.product_cats.iter())
+            .map(|(k, &c)| (k.as_slice(), c))
+    }
+
     #[inline]
     pub fn category_of(&self, product_id: &[u8]) -> u16 {
         let h = hash64_bytes(product_id);
         self.product_table
-            .find(h, |&idx| self.product_keys[idx as usize].eq_slice(product_id))
+            .find(h, |&idx| {
+                self.product_keys[idx as usize].eq_slice(product_id)
+            })
             .map_or(self.unknown_cat_id, |&idx| self.product_cats[idx as usize])
     }
 
@@ -143,7 +152,9 @@ impl Catalog {
     pub fn campaign_of(&self, campaign_id: &[u8]) -> Option<u16> {
         let h = hash64_bytes(campaign_id);
         self.campaign_table
-            .find(h, |&id| self.campaign_keys[id as usize].eq_slice(campaign_id))
+            .find(h, |&id| {
+                self.campaign_keys[id as usize].eq_slice(campaign_id)
+            })
             .copied()
     }
 }

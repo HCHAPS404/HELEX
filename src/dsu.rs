@@ -1,121 +1,37 @@
+use std::cmp::Ordering;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use hashbrown::HashTable;
+use crate::csv_dialect::{iter_data_lines, split_fields_csv};
+use crate::keys::{fast_key_bytes, id_key, is_slow, mix64, KeyMap};
 
-
-use crate::io_pool::process_csv_files_parallel;
-use crate::sso::{hash64_bytes, SmallBytes};
-
-pub struct UnionFind {
-    table: HashTable<u32>,
-    strings: Vec<SmallBytes>,
-    parent: Vec<u32>,
-    size: Vec<u32>,
-    min_id_idx: Vec<u32>,
+/// Linked-ID resolution on u64 user keys: user key -> canonical person key
+/// (the byte-wise smallest ID of its linked set).
+pub struct Dsu {
+    /// Bloom-style bit filter over member keys: most users are unlinked and
+    /// skip the map probe.
+    filter: Vec<u64>,
+    fbits: u32,
+    map: KeyMap,
+    canon: Vec<u64>,
+    /// Slow-form member keys with their bytes (for output / registry).
+    pub slow_bytes: Vec<(u64, Box<[u8]>)>,
 }
 
-impl UnionFind {
-    pub fn with_capacity(cap: usize) -> Self {
-        Self {
-            table: HashTable::with_capacity(cap),
-            strings: Vec::with_capacity(cap),
-            parent: Vec::with_capacity(cap),
-            size: Vec::with_capacity(cap),
-            min_id_idx: Vec::with_capacity(cap),
+impl Dsu {
+    #[inline(always)]
+    pub fn resolve(&self, user_key: u64) -> u64 {
+        if self.canon.is_empty() {
+            return user_key;
         }
-    }
-
-    #[inline]
-    pub fn intern_small(&mut self, sb: SmallBytes, hash: u64) -> u32 {
-        let strings = &self.strings;
-        if let Some(&idx) = self.table.find(hash, |&idx| strings[idx as usize] == sb) {
-            return idx;
+        let h = (mix64(user_key) >> (64 - self.fbits)) as usize;
+        if unsafe { *self.filter.get_unchecked(h >> 6) } & (1u64 << (h & 63)) == 0 {
+            return user_key;
         }
-        let idx = self.strings.len() as u32;
-        self.strings.push(sb);
-        self.parent.push(idx);
-        self.size.push(1);
-        self.min_id_idx.push(idx);
-        let strings = &self.strings;
-        self.table
-            .insert_unique(hash, idx, |&i| strings[i as usize].hash64());
-        idx
-    }
-
-    #[inline]
-    pub fn union_small(&mut self, a: SmallBytes, ha: u64, b: SmallBytes, hb: u64) {
-        if a == b {
-            self.intern_small(a, ha);
-            return;
-        }
-        let ia = self.intern_small(a, ha);
-        let ib = self.intern_small(b, hb);
-        let ra = self.find_index(ia);
-        let rb = self.find_index(ib);
-        if ra == rb {
-            return;
-        }
-        let sa = self.size[ra as usize];
-        let sb = self.size[rb as usize];
-        let (root, child) = if sa < sb { (rb, ra) } else { (ra, rb) };
-        self.parent[child as usize] = root;
-        self.size[root as usize] = sa + sb;
-
-        let root_min = self.min_id_idx[root as usize];
-        let child_min = self.min_id_idx[child as usize];
-        if self.strings[child_min as usize] < self.strings[root_min as usize] {
-            self.min_id_idx[root as usize] = child_min;
-        }
-    }
-
-    #[inline]
-    pub fn find_index(&mut self, index: u32) -> u32 {
-        let mut root = index;
-        while self.parent[root as usize] != root {
-            root = self.parent[root as usize];
-        }
-        let mut cur = index;
-        while self.parent[cur as usize] != root {
-            let next = self.parent[cur as usize];
-            self.parent[cur as usize] = root;
-            cur = next;
-        }
-        root
-    }
-
-    #[cfg(test)]
-    pub fn union_bytes(&mut self, a: &[u8], b: &[u8]) {
-        self.union_small(
-            SmallBytes::from_slice(a),
-            hash64_bytes(a),
-            SmallBytes::from_slice(b),
-            hash64_bytes(b),
-        );
-    }
-
-    pub fn finalize(&mut self) {
-        for idx in 0..self.parent.len() as u32 {
-            let root = self.find_index(idx);
-            self.min_id_idx[idx as usize] = self.min_id_idx[root as usize];
-        }
-    }
-
-    #[inline]
-    pub fn resolve<'a>(&'a self, raw_id: &'a [u8]) -> &'a [u8] {
-        if self.strings.is_empty() {
-            return raw_id;
-        }
-        let hash = hash64_bytes(raw_id);
-        if let Some(&idx) = self
-            .table
-            .find(hash, |&i| self.strings[i as usize].eq_slice(raw_id))
-        {
-            let min_idx = self.min_id_idx[idx as usize];
-            self.strings[min_idx as usize].as_slice()
-        } else {
-            raw_id
+        match self.map.get(user_key) {
+            Some(i) => unsafe { *self.canon.get_unchecked(i as usize) },
+            None => user_key,
         }
     }
 }
@@ -132,75 +48,163 @@ pub fn csv_paths(folder: &Path) -> Vec<PathBuf> {
     out
 }
 
-pub fn load_links(data_dir: &Path, threads: usize) -> io::Result<UnionFind> {
-    let paths = csv_paths(&data_dir.join("links"));
-    let total_bytes: u64 = paths
-        .iter()
-        .filter_map(|p| p.metadata().ok().map(|m| m.len()))
-        .sum();
-    let est_ids = ((total_bytes / 12) as usize).clamp(16, 4_000_000);
-    let block_sz = if total_bytes >= (64 << 20) {
-        4 << 20
-    } else {
-        1 << 20
-    };
+struct Uf {
+    idx: KeyMap,
+    keys: Vec<u64>,
+    parent: Vec<u32>,
+    size: Vec<u32>,
+    min_of: Vec<u32>,
+    slow: Vec<Option<Box<[u8]>>>,
+}
 
-    let worker_pairs = process_csv_files_parallel(
-        &paths,
-        block_sz,
-        threads,
-        |_| Vec::<(SmallBytes, u64, SmallBytes, u64)>::with_capacity(est_ids / threads.max(1) + 64),
-        |pairs, line| {
-            let fields = crate::csv_dialect::split_fields_csv::<2>(line);
-            if let Some([a, b]) = fields {
-                if !a.is_empty() && !b.is_empty() {
-                    pairs.push((
-                        SmallBytes::from_slice(a),
-                        hash64_bytes(a),
-                        SmallBytes::from_slice(b),
-                        hash64_bytes(b),
-                    ));
-                }
+impl Uf {
+    fn intern(&mut self, k: u64, raw: &[u8], slow: bool) -> u32 {
+        let next = self.keys.len() as u32;
+        let (i, inserted) = self.idx.get_or_insert(k, next);
+        if inserted {
+            self.keys.push(k);
+            self.parent.push(next);
+            self.size.push(1);
+            self.min_of.push(next);
+            self.slow.push(if slow { Some(raw.into()) } else { None });
+        }
+        i
+    }
+
+    fn find(&mut self, mut x: u32) -> u32 {
+        let mut root = x;
+        while self.parent[root as usize] != root {
+            root = self.parent[root as usize];
+        }
+        while self.parent[x as usize] != root {
+            let next = self.parent[x as usize];
+            self.parent[x as usize] = root;
+            x = next;
+        }
+        root
+    }
+
+    fn cmp_ids(&self, a: u32, b: u32) -> Ordering {
+        let mut ba = [0u8; 9];
+        let mut bb = [0u8; 9];
+        let sa: &[u8] = match &self.slow[a as usize] {
+            Some(s) => s,
+            None => {
+                let n = fast_key_bytes(self.keys[a as usize], b'u', &mut ba);
+                &ba[..n]
             }
-        },
-    )?;
+        };
+        let sb: &[u8] = match &self.slow[b as usize] {
+            Some(s) => s,
+            None => {
+                let n = fast_key_bytes(self.keys[b as usize], b'u', &mut bb);
+                &bb[..n]
+            }
+        };
+        sa.cmp(sb)
+    }
 
-    let mut uf = UnionFind::with_capacity(est_ids);
-    for pairs in worker_pairs {
-        for (a, ha, b, hb) in pairs {
-            uf.union_small(a, ha, b, hb);
+    fn union(&mut self, a: u32, b: u32) {
+        let ra = self.find(a);
+        let rb = self.find(b);
+        if ra == rb {
+            return;
+        }
+        let (root, child) = if self.size[ra as usize] < self.size[rb as usize] {
+            (rb, ra)
+        } else {
+            (ra, rb)
+        };
+        self.parent[child as usize] = root;
+        self.size[root as usize] += self.size[child as usize];
+        let rm = self.min_of[root as usize];
+        let cm = self.min_of[child as usize];
+        if self.cmp_ids(cm, rm) == Ordering::Less {
+            self.min_of[root as usize] = cm;
         }
     }
-    uf.finalize();
-    Ok(uf)
+}
+
+pub fn load_links(data_dir: &Path) -> io::Result<Dsu> {
+    let paths = csv_paths(&data_dir.join("links"));
+    let mut uf = Uf {
+        idx: KeyMap::with_capacity(1024),
+        keys: Vec::new(),
+        parent: Vec::new(),
+        size: Vec::new(),
+        min_of: Vec::new(),
+        slow: Vec::new(),
+    };
+    for p in paths {
+        let bytes = fs::read(&p)?;
+        iter_data_lines(&bytes, |line| {
+            if let Some([a, b]) = split_fields_csv::<2>(line) {
+                if !a.is_empty() && !b.is_empty() {
+                    let (ka, sa) = id_key(a, b'u');
+                    let (kb, sb) = id_key(b, b'u');
+                    let ia = uf.intern(ka, a, sa);
+                    let ib = uf.intern(kb, b, sb);
+                    if ia != ib {
+                        uf.union(ia, ib);
+                    }
+                }
+            }
+        });
+    }
+    let n = uf.keys.len();
+    let mut map = KeyMap::with_capacity(n.max(1));
+    let mut canon: Vec<u64> = Vec::new();
+    let fbits = ((n.max(1) * 16).next_power_of_two().trailing_zeros()).clamp(12, 30);
+    let mut filter = vec![0u64; (1usize << fbits) / 64];
+    for i in 0..n as u32 {
+        let r = uf.find(i);
+        let m = uf.min_of[r as usize];
+        if m != i {
+            let k = uf.keys[i as usize];
+            map.insert(k, canon.len() as u32);
+            canon.push(uf.keys[m as usize]);
+            let h = (mix64(k) >> (64 - fbits)) as usize;
+            filter[h >> 6] |= 1u64 << (h & 63);
+        }
+    }
+    let slow_bytes = uf
+        .keys
+        .iter()
+        .zip(uf.slow.iter_mut())
+        .filter_map(|(&k, s)| s.take().map(|b| (k, b)))
+        .collect::<Vec<_>>();
+    debug_assert!(slow_bytes.iter().all(|(k, _)| is_slow(*k)));
+    Ok(Dsu {
+        filter,
+        fbits,
+        map,
+        canon,
+        slow_bytes,
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::UnionFind;
+    use super::*;
 
     #[test]
-    fn keeps_bytewise_minimum_across_chain_and_ghosts() {
-        let mut uf = UnionFind::with_capacity(16);
-        uf.union_bytes(b"U1", b"u2");
-        uf.union_bytes(b"u2", b"u3");
-        uf.union_bytes(b"u3", b"A0");
-        uf.finalize();
-
-        assert_eq!(uf.resolve(b"u3"), b"A0");
-        assert_eq!(uf.resolve(b"U1"), b"A0");
-        assert_eq!(uf.resolve(b"absent"), b"absent");
-    }
-
-    #[test]
-    fn long_chain_400_hops_no_stack_overflow() {
-        let mut uf = UnionFind::with_capacity(512);
-        for i in 0..400usize {
-            let a = format!("u{i:04}");
-            let b = format!("u{:04}", i + 1);
-            uf.union_bytes(a.as_bytes(), b.as_bytes());
+    fn chain_and_bytewise_min() {
+        let dir = std::env::temp_dir().join(format!("helex_dsu_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("links")).unwrap();
+        let mut body =
+            String::from("user_id_a,user_id_b\nU1,u2\nu2,u3\nu3,A0\nlong_user_name_x,u3\n");
+        for i in 0..400 {
+            body.push_str(&format!("v{:04},v{:04}\n", i, i + 1));
         }
-        uf.finalize();
-        assert_eq!(uf.resolve(b"u0400"), b"u0000");
+        fs::write(dir.join("links/part-0.csv"), body).unwrap();
+        let d = load_links(&dir).unwrap();
+        let k = |s: &[u8]| id_key(s, b'u').0;
+        assert_eq!(d.resolve(k(b"u3")), k(b"A0"));
+        assert_eq!(d.resolve(k(b"U1")), k(b"A0"));
+        assert_eq!(d.resolve(k(b"long_user_name_x")), k(b"A0"));
+        assert_eq!(d.resolve(k(b"absent")), k(b"absent"));
+        assert_eq!(d.resolve(k(b"v0400")), k(b"v0000"));
+        let _ = fs::remove_dir_all(&dir);
     }
 }
