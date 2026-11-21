@@ -391,55 +391,36 @@ fn emit_shard(
         for (w_idx, &word) in win_bits[b].iter().enumerate() {
             let mut w = word;
             while w != 0 {
-                // Batch up to 8 winners: gather indices, then resolve canon
-                // keys — independent linkmap probes the CPU can overlap
-                // (MLP), instead of one serial dependent probe per winner.
-                let mut batch_r = [0usize; 8];
-                let mut nb = 0usize;
-                while w != 0 && nb < 8 {
-                    batch_r[nb] = (w_idx << 6) + w.trailing_zeros() as usize;
-                    nb += 1;
-                    w &= w - 1;
-                }
-                let mut cks = [0u64; 8];
-                for j in 0..nb {
-                    let rec = &sb.recs[batch_r[j]];
-                    let uk = rec.user_key;
-                    cks[j] = if rec.user_loc == u32::MAX && uk != 0 {
-                        link_maps[(uk >> 56) as usize].get(uk).unwrap_or(uk)
-                    } else {
-                        let bytes = key_bytes(
-                            uk,
-                            b'u',
-                            &sb.side,
-                            rec.user_loc,
-                            &mut tmp_a,
-                        );
-                        let canon = dsu.resolve(bytes);
-                        let (ck, cslow) = field_key(canon, b'u');
-                        if cslow || ck == 0 {
-                            side_emit[(ck >> 56) as usize]
-                                .lock()
-                                .unwrap()
-                                .push((ck, SmallBytes::from_slice(canon)));
-                        }
-                        ck
-                    };
-                }
-                for j in 0..nb {
-                    let ck = cks[j];
-                    let part = (ck >> 56) as usize;
-                    stage[part][stage_n[part] as usize] = Rec16 {
-                        canon_key: ck,
-                        ev: sb.recs[batch_r[j]].ev,
-                    };
-                    let n = stage_n[part] + 1;
-                    if n == 4 {
-                        parts[part].extend_from_slice(&stage[part]);
-                        stage_n[part] = 0;
-                    } else {
-                        stage_n[part] = n;
+                let r = (w_idx << 6) + w.trailing_zeros() as usize;
+                w &= w - 1;
+                let rec = &sb.recs[r];
+                let uk = rec.user_key;
+                let ck = if rec.user_loc == u32::MAX && uk != 0 {
+                    link_maps[(uk >> 56) as usize].get(uk).unwrap_or(uk)
+                } else {
+                    let bytes =
+                        key_bytes(uk, b'u', &sb.side, rec.user_loc, &mut tmp_a);
+                    let canon = dsu.resolve(bytes);
+                    let (ck, cslow) = field_key(canon, b'u');
+                    if cslow || ck == 0 {
+                        side_emit[(ck >> 56) as usize]
+                            .lock()
+                            .unwrap()
+                            .push((ck, SmallBytes::from_slice(canon)));
                     }
+                    ck
+                };
+                let part = (ck >> 56) as usize;
+                stage[part][stage_n[part] as usize] = Rec16 {
+                    canon_key: ck,
+                    ev: rec.ev,
+                };
+                let n = stage_n[part] + 1;
+                if n == 4 {
+                    parts[part].extend_from_slice(&stage[part]);
+                    stage_n[part] = 0;
+                } else {
+                    stage_n[part] = n;
                 }
             }
         }
