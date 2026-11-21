@@ -81,7 +81,27 @@ fn fmt_ts(out: &mut Vec<u8>, rng: &mut Rng, ms: i64) {
     }
 }
 
+fn edge() -> bool {
+    std::env::var("SYNTH_EDGE").is_ok_and(|v| v == "1")
+}
+
+/// User id spelling. With SYNTH_EDGE=1 some users get long (slow-path),
+/// non-ASCII or space-prefixed ids, consistently across files.
 fn user_name(out: &mut Vec<u8>, u: u64) {
+    if edge() {
+        if u % 7 == 0 {
+            write!(out, "user_with_a_long_name_{u}").unwrap();
+            return;
+        }
+        if u % 11 == 0 {
+            write!(out, "\u{fc}{u}").unwrap();
+            return;
+        }
+        if u % 13 == 0 {
+            write!(out, " u{u}").unwrap();
+            return;
+        }
+    }
     write!(out, "u{u}").unwrap();
 }
 
@@ -234,11 +254,14 @@ fn main() {
             if ur < 2 {
                 line.push(b',');
             } else if ur < 5 {
-                write!(line, "\"u{uu}\",").unwrap();
+                line.push(b'"');
+                user_name(&mut line, uu);
+                line.extend_from_slice(b"\",");
             } else if ur < 6 && uu % 64 == 0 {
                 write!(line, "user_with_a_long_name_{uu},").unwrap();
             } else {
-                write!(line, "u{uu},").unwrap();
+                user_name(&mut line, uu);
+                line.push(b',');
             }
             // ts
             if rng.chance(4) {
@@ -311,14 +334,24 @@ fn main() {
     for k in 0..n_clicks {
         let r = rng.below(1 << 20) as f64 / (1u64 << 20) as f64;
         let u = ((r * r) * n_users as f64) as u64;
-        let t = WS - 8 * DAY_MS + rng.below(((NUM_DAYS + 9) * DAY_MS) as u64) as i64;
+        let mut t = WS - 8 * DAY_MS + rng.below(((NUM_DAYS + 9) * DAY_MS) as u64) as i64;
+        if edge() {
+            t -= t.rem_euclid(3_600_000); // hour-aligned: equal-ts ties per person
+        }
         line.clear();
         let kid = if rng.chance(5) { rng.below(k + 1) } else { k };
-        write!(line, "k{kid},").unwrap();
-        if rng.chance(3) {
-            write!(line, "\"u{u}\",").unwrap();
+        if edge() && kid % 5 == 0 {
+            write!(line, "click-identifier-long-{kid},").unwrap();
         } else {
-            write!(line, "u{u},").unwrap();
+            write!(line, "k{kid},").unwrap();
+        }
+        if rng.chance(3) {
+            line.push(b'"');
+            user_name(&mut line, u);
+            line.extend_from_slice(b"\",");
+        } else {
+            user_name(&mut line, u);
+            line.push(b',');
         }
         if rng.chance(10) {
             write!(line, "c_{},", n_camps + 5).unwrap();
