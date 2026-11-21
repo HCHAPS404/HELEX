@@ -1117,12 +1117,18 @@ pub fn run_pipeline(
         std::thread::scope(|scope| {
         let dedup_handle = scope.spawn(|| {
             let td = std::time::Instant::now();
-            // Phase A: per-shard dedup insert + winner bits.
-            let a_slots: Vec<Mutex<Option<Vec<Vec<u64>>>>> = (0..NUM_SHARDS)
-                .map(|_| Mutex::new(None))
+            // Fused dedup+emit per shard: emit[s] runs as soon as insert[s]
+            // finishes while other shards still insert — no phase barrier.
+            // win_bits stays local (consumed only by the same shard's emit).
+            let side_emit: Vec<Mutex<Vec<(u64, SmallBytes)>>> = (0..NUM_SHARDS)
+                .map(|_| Mutex::new(Vec::new()))
+                .collect();
+            let p_slots: Vec<Mutex<Vec<Vec<Rec16>>>> = (0..NUM_SHARDS)
+                .map(|_| Mutex::new((0..NUM_SHARDS).map(|_| Vec::new()).collect()))
                 .collect();
             {
-                let a_ref = &a_slots;
+                let p_ref = &p_slots;
+                let se_ref = &side_emit;
                 parallel_for(NUM_SHARDS, threads, |s| {
                     let bufs = &shard_inputs_ref[s];
                     if bufs.is_empty() {
@@ -1135,33 +1141,7 @@ pub fn run_pipeline(
                     let bits = DEDUP_TAB.with(|t| {
                         dedup_insert_mark(bufs, &mut t.borrow_mut(), ins_ref)
                     });
-                    *a_ref[s].lock().unwrap() = Some(bits);
-                });
-            }
-
-            let mut win_bits: Vec<Vec<Vec<u64>>> = Vec::with_capacity(NUM_SHARDS);
-            for m in a_slots {
-                win_bits.push(m.into_inner().unwrap().unwrap_or_default());
-            }
-
-            // Phase E: emit winners to canon partitions (person identity =
-            // canon_key). Slow canons record their bytes in side_emit so
-            // process_partition can recover the canonical user id.
-            let side_emit: Vec<Mutex<Vec<(u64, SmallBytes)>>> = (0..NUM_SHARDS)
-                .map(|_| Mutex::new(Vec::new()))
-                .collect();
-            let p_slots: Vec<Mutex<Vec<Vec<Rec16>>>> = (0..NUM_SHARDS)
-                .map(|_| Mutex::new((0..NUM_SHARDS).map(|_| Vec::new()).collect()))
-                .collect();
-            {
-                let p_ref = &p_slots;
-                let w_ref = &win_bits;
-                let se_ref = &side_emit;
-                parallel_for(NUM_SHARDS, threads, |s| {
-                    if w_ref[s].is_empty() {
-                        return;
-                    }
-                    let winners: usize = w_ref[s]
+                    let winners: usize = bits
                         .iter()
                         .flat_map(|w| w.iter())
                         .map(|w| w.count_ones() as usize)
@@ -1171,8 +1151,8 @@ pub fn run_pipeline(
                         .map(|_| Vec::with_capacity(per_part))
                         .collect();
                     emit_shard(
-                        &shard_inputs_ref[s][..],
-                        &w_ref[s],
+                        bufs,
+                        &bits,
                         link_maps_ref,
                         dsu_ref,
                         se_ref,
