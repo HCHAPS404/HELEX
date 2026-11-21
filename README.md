@@ -1,4 +1,4 @@
-<<<<<<< HEAD
+
 # HELEX — Shopping Sessions 4 (Rust engine)
 
 Implementación nativa en Rust del benchmark `shopping-sessions-4`. Reemplaza
