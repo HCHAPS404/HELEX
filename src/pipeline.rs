@@ -99,7 +99,7 @@ fn validate_event_copy<'a>(
     fields: [&'a [u8]; 7],
     ingest_ms: i64,
     catalog: &Catalog,
-    dsu: &'a UnionFind,
+    _dsu: &'a UnionFind,
 ) -> Option<(&'a [u8], ValidEvent)> {
     let user_raw = fields[1];
     if user_raw.is_empty() {
@@ -121,14 +121,13 @@ fn validate_event_copy<'a>(
     if ingest_ms - ts > LATE_LIMIT_MS {
         return None;
     }
-    let person = dsu.resolve(user_raw);
     let cat_id = if is_purchase {
         catalog.category_of(product_raw)
     } else {
         0
     };
     Some((
-        person,
+        user_raw,
         ValidEvent {
             ts,
             price_cents,
@@ -147,6 +146,7 @@ fn pack_pos(buf_idx: usize, off: usize) -> u64 {
 
 fn dedup_one_shard(
     bufs: &[Vec<u8>],
+    dsu: &UnionFind,
     table: &mut HashTable<usize>,
     slots: &mut Vec<ShardDedupSlot>,
     parts: &mut Vec<Vec<Survivor>>,
@@ -214,7 +214,7 @@ fn dedup_one_shard(
             let p_len =
                 u32::from_le_bytes(shard_buf[p..p + 4].try_into().unwrap()) as usize;
             p += 4;
-            let person = &shard_buf[p..p + p_len];
+            let person = dsu.resolve(&shard_buf[p..p + p_len]);
             p += p_len;
             let ts = i64::from_le_bytes(shard_buf[p..p + 8].try_into().unwrap());
             let price_cents =
@@ -629,7 +629,7 @@ pub fn run_pipeline(
         let mut slots: Vec<ShardDedupSlot> = Vec::with_capacity(est);
         let mut parts: Vec<Vec<Survivor>> =
             (0..NUM_SHARDS).map(|_| Vec::new()).collect();
-        dedup_one_shard(bufs, &mut table, &mut slots, &mut parts);
+        dedup_one_shard(bufs, dsu_ref, &mut table, &mut slots, &mut parts);
         *surv_slots_ref[s].lock().unwrap() = Some(parts);
     });
     let survivors: Vec<Vec<Vec<Survivor>>> = surv_slots
