@@ -26,3 +26,44 @@ Hardware oficial del evaluador: GCP `n2` Intel Xeon (`linux/amd64`), 8 vCPUs, 24
 Modal shared-node variance is +/-40%; treated as range ~2.4-3.1 s.
 Official practice score for the 2.72 s baseline was 3.60 s (calibration:
 official ~= 0.22 + 1.24 * modal_wall). Current waves project ~3.0-3.4 s.
+
+## Post-submission waves 4-5 (HCHAPS404-DEVELOP, commits ff5d627..647f931)
+
+| Commit | Cambio | Modal 20M | Oficial |
+|---|---|---|---|
+| `6591936` | baseline submitted | 2.72 s | **3.60 s** |
+| `d1dd8ed` | Waves 1-3 (packed ev, 64B records, dense camp grid) | 2.38-3.09 s | **3.49 s** |
+| `ff5d627` | +overlap dedup/clicks, x86-64-v2 | 2.54 s | — |
+| `42cdbd5` | +mmap ingest, cold-cache fadvise bench | 2.27 s (int 2.07) | — |
+| `4dcd362` | +unified CSV scanner (comma split + boundary quotes) | ~2.2-2.5 s | **3.35 s** |
+| `edde8b9` | +DSU build overlapped with events ingest (dsu=0.000s) | — | — |
+| `eb4af27`+`bda6c68` | +musl static + FROM scratch (image 80 MB -> 2.56 MB) | — | — |
+| `82c1942` | +MADV_SEQUENTIAL+WILLNEED, -is_ascii flag, mimalloc THP env | — | — |
+| `308e7d9`/`647f931` | +AVX2 3-mask field scanner (32B blocks, u128 masks) | **1.64 s (int 1.59)** | **3.31 s** |
+
+Last Modal run (seed 3, cold cache): `cat=0.009 dsu=0.000 events=1.322
+clicks=0.000 sess=0.164 parquet=0.099 total=1.595s`, invariants 5/5.
+
+### Findings
+
+- **musl vs glibc A/B (native docker volume, same host, 5M dataset)**:
+  musl 6.7 s vs glibc 8.7 s -> musl is NOT slower; hypothesis refuted.
+- **Scorer insensitivity**: internal -0.5 s (2.1 -> 1.59) moved official
+  only 3.35 -> 3.31. Scorer wall appears dominated by ~2.9-3.0 s floor
+  (cold I/O + slower scorer CPU + container overhead). A competitor hit
+  0.59 s, so the floor is breakable, but the compute path must shrink
+  ~3-4x further.
+- Failed experiment `f3a2b08` (global lock-free single-pass dedup):
+  events 1.7 -> 4.7 s; CAS + atomic bump contention. Reverted; two-pass
+  thread-local wins.
+
+### Next refactor spec (pending implementation)
+
+Unified 48B record replacing 64B `EvRecord`:
+- `key:u64` event id: `e`+len<=9 -> `be(id[1..]) | 1<<63`; len<=8 with
+  b0<0x80 -> `be(id)`; else hash64 + side-arena bytes (`id_loc:u32`).
+  Injective within domains, bit63 separates them; byte-compare only for
+  side-arena ids. Dedup fast path = single u64 `==`, zero FxHash/copies.
+- `user_key:u64` same scheme; bytes recovered in emit via leading_zeros.
+- Open-addressing table (u64 key -> u32 idx) with min-ingest winner,
+  sequential per shard, no generic hashbrown.
