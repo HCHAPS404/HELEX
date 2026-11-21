@@ -7,7 +7,7 @@ use std::sync::Mutex;
 use hashbrown::HashTable;
 
 use crate::catalog::Catalog;
-use crate::csv_dialect::{parse_fixed_fields, parse_price_cents, split_fields_csv};
+use crate::csv_dialect::{parse_price_cents, split_fields_csv};
 use crate::dsu::{csv_paths, UnionFind};
 use crate::io_pool::{parallel_for, process_csv_files_parallel, worker_count};
 use crate::mem_guard::should_spill_events;
@@ -566,12 +566,8 @@ pub fn run_pipeline(
                     })
                     .collect::<Vec<_>>()
             },
-            |shards, line, ascii| {
-                let fields = if ascii {
-                    split_fields_csv::<7>(line)
-                } else {
-                    parse_fixed_fields::<7>(line)
-                };
+            |shards, line| {
+                let fields = split_fields_csv::<7>(line);
                 let Some(fields) = fields else {
                     return;
                 };
@@ -632,12 +628,8 @@ pub fn run_pipeline(
             block_sz,
             threads,
             |_| ShardBuf::new(),
-            |tmp, line, ascii| {
-                let fields = if ascii {
-                    split_fields_csv::<7>(line)
-                } else {
-                    parse_fixed_fields::<7>(line)
-                };
+            |tmp, line| {
+                let fields = split_fields_csv::<7>(line);
                 let Some(fields) = fields else {
                     return;
                 };
@@ -780,12 +772,8 @@ pub fn run_pipeline(
             |_| {
                 (0..NUM_SHARDS).map(|_| Vec::<ClickCand>::new()).collect::<Vec<_>>()
             },
-            |parts, line, ascii| {
-                let fields = if ascii {
-                    split_fields_csv::<4>(line)
-                } else {
-                    parse_fixed_fields::<4>(line)
-                };
+            |parts, line| {
+                let fields = split_fields_csv::<4>(line);
                 let Some(fields) = fields else {
                     return;
                 };

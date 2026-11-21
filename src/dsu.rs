@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use hashbrown::HashTable;
 
-use crate::csv_dialect::parse_fixed_fields;
+
 use crate::io_pool::process_csv_files_parallel;
 use crate::sso::{hash64_bytes, SmallBytes};
 
@@ -150,12 +150,8 @@ pub fn load_links(data_dir: &Path, threads: usize) -> io::Result<UnionFind> {
         block_sz,
         threads,
         |_| Vec::<(SmallBytes, u64, SmallBytes, u64)>::with_capacity(est_ids / threads.max(1) + 64),
-        |pairs, line, ascii| {
-            let fields = if ascii {
-                crate::csv_dialect::split_fields_csv::<2>(line)
-            } else {
-                parse_fixed_fields::<2>(line)
-            };
+        |pairs, line| {
+            let fields = crate::csv_dialect::split_fields_csv::<2>(line);
             if let Some([a, b]) = fields {
                 if !a.is_empty() && !b.is_empty() {
                     pairs.push((

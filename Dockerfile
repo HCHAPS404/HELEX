@@ -24,4 +24,5 @@ COPY --chmod=0755 run.sh /app/run.sh
 
 WORKDIR /app
 USER 1000
+ENV MIMALLOC_LARGE_OS_PAGES=1 MIMALLOC_EAGER_COMMIT=1
 CMD ["/app/shopping-sessions"]
