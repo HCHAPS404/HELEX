@@ -67,3 +67,50 @@ Unified 48B record replacing 64B `EvRecord`:
 - `user_key:u64` same scheme; bytes recovered in emit via leading_zeros.
 - Open-addressing table (u64 key -> u32 idx) with min-ingest winner,
   sequential per shard, no generic hashbrown.
+
+## Motor reescrito (rama `perf/sub-1.5s`)
+
+Entorno de medición: VM Firecracker compartida, 4 vCPU Xeon 2.1 GHz, 15 GB,
+`NCPU=4`, archivos en page cache. Hay mucho ruido entre corridas (±10–15 %):
+los números son el mínimo/mediana de 5–8 corridas alternadas. En esta VM, tocar
+memoria nueva cuesta ~0.5–1 s/GB por hilo (`clear_page_erms` aparece en el
+perfil). Datos: `tools/synthgen`, que aproxima la forma de los oficiales pero
+no es el generador oficial.
+
+| Build | 20M eventos (wall) | 60M eventos (wall) | RSS anónimo 20M |
+|---|---|---|---|
+| `main` (`d8889cf`) | ~53 s ⚠️ | — | ~4.5 GB |
+| `main` + fix de hash (`1405152`) | 2.9 s | 13.1 s | ~4.8 GB |
+| motor reescrito (HEAD) | **~1.05–1.2 s** | **~3.4–3.6 s** | ~1.2 GB |
+
+⚠️ Con IDs cortos de largo variable (`u123`, `e45`) el `mix64` anterior
+(`k * K & mask`) usaba bits bajos que valen cero, y los shards de usuario
+salían del byte alto crudo (~9 de 256 en uso). Con los IDs sintéticos eso
+explotaba (53 s). Los IDs oficiales no lo disparaban así (score 2.75 s), pero
+el arreglo vuelve el motor robusto a cualquier forma de ID.
+
+Desglose en un hilo (20M, HEAD): parse ≈ 2.2–3.0 s, dedup ≈ 0.57 s,
+sess ≈ 1.2 s (del cual escribir Parquet ≈ 0.27 s). A 4 hilos: parse ≈ 0.6 s,
+dedup ≈ 0.13 s, sess ≈ 0.3 s.
+
+Salida idéntica (`scripts/compare.py`) al motor de `main` en: 36 fixtures,
+20M sintético, 60M sintético, y 3M con `SYNTH_EDGE=1` (IDs largos, no ASCII y
+con espacios; click ids >16 bytes; empates de timestamp en clicks).
+
+### A/B medidos en el motor nuevo
+
+| Cambio | Resultado |
+|---|---|
+| `memcpy` a `[u8;8]` + load u64 en claves → loads anchos enmascarados | parse 5.0 → 3.2 s (1 hilo): era un *store-forwarding stall* |
+| SWAR para timestamps F1 | incluido arriba |
+| barrido de ganadores aleatorio → re-scan secuencial | dedup 1.13 → 0.76 s (1 hilo) |
+| bitmaps SIMD por chunk + ventanas de 128 bits | parse −10 % |
+| `pread` → `mmap` + `MADV_POPULATE_READ` | −3–5 % |
+| escribir `user_daily` en streaming | out 0.09 → 0.01 s y −120 MB de RSS |
+| tabla de dedup intercalada + 1024 shards + filtro DSU | dedup 0.27 → 0.12 s (4 hilos) |
+| shards/particiones según tamaño de entrada | 60M: 3.97 → 3.65 s |
+| musl vs glibc estático | musl ~15 % más lento → Dockerfile con glibc estático |
+| THP en la arena | ~5 % mejor; se deja activo (`HELEX_THP=0` lo apaga) |
+| chunk 1 MiB vs 256 KiB vs 128 KiB | dentro del ruido; 256 KiB por L2 del scorer |
+| `MIMALLOC_LARGE_OS_PAGES`/`EAGER_COMMIT` | sin efecto medible; quitado |
+| grilla de campañas en arreglos `u32` separados | sin efecto; revertido |
