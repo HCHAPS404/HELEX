@@ -51,6 +51,28 @@ pub fn parse_fixed_fields<'a, const N: usize>(mut line: &'a [u8]) -> Option<[&'a
     Some(out)
 }
 
+/// Fast path for lines in an ASCII-verified chunk with no `"` anywhere:
+/// fields are returned raw, with only comma-count validation.
+#[inline]
+pub fn split_fields_unquoted<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
+    if line.is_empty() {
+        return None;
+    }
+    let mut out = [&[][..]; N];
+    let mut start = 0usize;
+    for slot in out.iter_mut().take(N - 1) {
+        let rel = memchr::memchr(b',', &line[start..])?;
+        *slot = &line[start..start + rel];
+        start += rel + 1;
+    }
+    let tail = &line[start..];
+    if memchr::memchr(b',', tail).is_some() {
+        return None;
+    }
+    out[N - 1] = tail;
+    Some(out)
+}
+
 #[inline]
 pub fn parse_price_cents(raw: &[u8]) -> Option<u32> {
     if raw.is_empty() {

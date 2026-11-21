@@ -3,6 +3,7 @@ use std::io::{self, BufWriter};
 use std::path::Path;
 use std::sync::Arc;
 
+use bytes::{Bytes, BytesMut};
 use parquet::basic::{Compression, ConvertedType, Encoding, LogicalType, Repetition, Type as PhysicalType};
 use parquet::data_type::{ByteArray, ByteArrayType, Int32Type, Int64Type};
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
@@ -166,6 +167,10 @@ pub fn write_user_daily_part(
     let mut writer = SerializedFileWriter::new(file, schema, props)
         .map_err(|e| io::Error::other(e.to_string()))?;
 
+    let cat_bytes: Vec<Bytes> = categories
+        .iter()
+        .map(|c| Bytes::copy_from_slice(c))
+        .collect();
     let total: usize = parts.iter().map(|p| p.len()).sum();
     let cap = BATCH_ROWS.min(total);
     let mut user_ids = Vec::with_capacity(cap);
@@ -185,8 +190,12 @@ pub fn write_user_daily_part(
         cat_defs.clear();
         cat_vals.clear();
 
+        let mut id_pool = BytesMut::with_capacity(chunk.len() * 12);
         for r in chunk {
-            user_ids.push(ByteArray::from(r.user_id.as_slice().to_vec()));
+            id_pool.extend_from_slice(r.user_id.as_slice());
+            user_ids.push(ByteArray::from(
+                id_pool.split_to(r.user_id.as_slice().len()).freeze(),
+            ));
             days.push(r.day);
             sessions.push(r.sessions);
             events.push(r.events);
@@ -194,7 +203,7 @@ pub fn write_user_daily_part(
             match r.top_category {
                 Some(cid) => {
                     cat_defs.push(1i16);
-                    cat_vals.push(ByteArray::from(categories[cid as usize].clone()));
+                    cat_vals.push(ByteArray::from(cat_bytes[cid as usize].clone()));
                 }
                 None => {
                     cat_defs.push(0i16);
@@ -266,8 +275,14 @@ pub fn write_campaign_daily(out_dir: &Path, rows: &[CampaignDailyRow]) -> io::Re
 
     if !rows.is_empty() {
         for chunk in rows.chunks(BATCH_ROWS) {
-            let cids: Vec<ByteArray> = chunk.iter().map(|r| ByteArray::from(r.campaign_id.clone())).collect();
-            let chans: Vec<ByteArray> = chunk.iter().map(|r| ByteArray::from(r.channel.clone())).collect();
+            let cids: Vec<ByteArray> = chunk
+                .iter()
+                .map(|r| ByteArray::from(Bytes::copy_from_slice(&r.campaign_id)))
+                .collect();
+            let chans: Vec<ByteArray> = chunk
+                .iter()
+                .map(|r| ByteArray::from(Bytes::copy_from_slice(&r.channel)))
+                .collect();
             let days: Vec<i32> = chunk.iter().map(|r| r.day).collect();
             let sess: Vec<i64> = chunk.iter().map(|r| r.sessions).collect();
             let psess: Vec<i64> = chunk.iter().map(|r| r.purchasing_sessions).collect();

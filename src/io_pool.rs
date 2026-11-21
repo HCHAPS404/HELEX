@@ -121,7 +121,7 @@ pub fn process_csv_files_parallel<S, InitFn, LineFn>(
 where
     S: Send,
     InitFn: Fn(usize) -> S + Sync,
-    LineFn: Fn(&mut S, &[u8]) + Sync,
+    LineFn: Fn(&mut S, &[u8], bool) + Sync,
 {
     let mut sized_paths: Vec<(u64, &PathBuf)> = Vec::with_capacity(paths.len());
     for p in paths {
@@ -211,7 +211,7 @@ fn execute_chunk<S, LineFn>(
     process_line: &LineFn,
 ) -> io::Result<()>
 where
-    LineFn: Fn(&mut S, &[u8]),
+    LineFn: Fn(&mut S, &[u8], bool),
 {
     let read_from = if task.c_start == task.data_start {
         task.c_start
@@ -241,6 +241,8 @@ where
         read_to = next_to;
     }
 
+    let chunk_ascii = buf.is_ascii();
+
     let mut pos = if task.c_start == task.data_start {
         0usize
     } else if buf.first() == Some(&b'\n') {
@@ -255,11 +257,11 @@ where
     while pos < limit_in_buf && pos < buf.len() {
         match memchr::memchr(b'\n', &buf[pos..]) {
             Some(rel) => {
-                process_line(state, &buf[pos..pos + rel]);
+                process_line(state, &buf[pos..pos + rel], chunk_ascii);
                 pos += rel + 1;
             }
             None => {
-                process_line(state, &buf[pos..]);
+                process_line(state, &buf[pos..], chunk_ascii);
                 break;
             }
         }
@@ -308,7 +310,7 @@ mod tests {
                 chunk_sz,
                 4,
                 |_| Vec::<Vec<u8>>::new(),
-                |st, line| st.push(line.to_vec()),
+                |st, line, _ascii| st.push(line.to_vec()),
             )
             .unwrap();
             let mut got: Vec<Vec<u8>> = states.into_iter().flatten().collect();

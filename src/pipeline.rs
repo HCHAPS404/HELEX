@@ -8,7 +8,7 @@ use hashbrown::HashTable;
 use rustc_hash::FxHashMap;
 
 use crate::catalog::Catalog;
-use crate::csv_dialect::{parse_fixed_fields, parse_price_cents};
+use crate::csv_dialect::{parse_fixed_fields, parse_price_cents, split_fields_unquoted};
 use crate::dsu::{csv_paths, UnionFind};
 use crate::io_pool::{parallel_for, process_csv_files_parallel, worker_count};
 use crate::mem_guard::should_spill_events;
@@ -524,8 +524,13 @@ pub fn run_pipeline(
             |_| {
                 (0..NUM_SHARDS).map(|_| Vec::<u8>::new()).collect::<Vec<_>>()
             },
-            |shards, line| {
-                let Some(fields) = parse_fixed_fields::<7>(line) else {
+            |shards, line, ascii| {
+                let fields = if ascii && memchr::memchr(b'"', line).is_none() {
+                    split_fields_unquoted::<7>(line)
+                } else {
+                    parse_fixed_fields::<7>(line)
+                };
+                let Some(fields) = fields else {
                     return;
                 };
                 let event_id = fields[0];
@@ -571,8 +576,13 @@ pub fn run_pipeline(
             block_sz,
             threads,
             |_| Vec::<u8>::with_capacity(96),
-            |tmp, line| {
-                let Some(fields) = parse_fixed_fields::<7>(line) else {
+            |tmp, line, ascii| {
+                let fields = if ascii && memchr::memchr(b'"', line).is_none() {
+                    split_fields_unquoted::<7>(line)
+                } else {
+                    parse_fixed_fields::<7>(line)
+                };
+                let Some(fields) = fields else {
                     return;
                 };
                 let event_id = fields[0];
@@ -660,8 +670,13 @@ pub fn run_pipeline(
             |_| {
                 (0..NUM_SHARDS).map(|_| Vec::<ClickCand>::new()).collect::<Vec<_>>()
             },
-            |parts, line| {
-                let Some(fields) = parse_fixed_fields::<4>(line) else {
+            |parts, line, ascii| {
+                let fields = if ascii && memchr::memchr(b'"', line).is_none() {
+                    split_fields_unquoted::<4>(line)
+                } else {
+                    parse_fixed_fields::<4>(line)
+                };
+                let Some(fields) = fields else {
                     return;
                 };
                 let click_id = fields[0];
@@ -729,6 +744,8 @@ pub fn run_pipeline(
         .filter_map(|m| m.into_inner().unwrap())
         .collect();
     let t_sess = t4.elapsed();
+    std::mem::forget(survivors);
+    std::mem::forget(click_parts);
 
     let t5 = std::time::Instant::now();
     let user_dir = out_dir.join("user_daily");
@@ -814,8 +831,7 @@ pub fn run_pipeline(
             camp_rows.len()
         );
     }
-    let _ = all_part_results;
-
+    std::mem::forget(all_part_results);
     Ok(())
 }
 
