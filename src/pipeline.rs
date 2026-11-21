@@ -389,28 +389,6 @@ fn emit_shard(
     let mut stage_n: [u8; NUM_SHARDS] = [0; NUM_SHARDS];
     for (b, sb) in bufs.iter().enumerate() {
         for (w_idx, &word) in win_bits[b].iter().enumerate() {
-            // Prefetch the linkmap slot for each winner ~2 words (~128 recs)
-            // ahead, so the random probe hits a line already in flight.
-            #[cfg(target_arch = "x86_64")]
-            if let Some(&pword) = win_bits[b].get(w_idx + 2) {
-                let mut pw = pword;
-                while pw != 0 {
-                    let r = ((w_idx + 2) << 6) + pw.trailing_zeros() as usize;
-                    pw &= pw - 1;
-                    let rec = unsafe { sb.recs.get_unchecked(r) };
-                    if rec.user_loc == u32::MAX {
-                        let uk = rec.user_key;
-                        let m = &link_maps[(uk >> 56) as usize];
-                        let slot = (mix64(uk) as usize) & m.mask;
-                        unsafe {
-                            core::arch::x86_64::_mm_prefetch(
-                                m.keys.as_ptr().add(slot) as *const i8,
-                                core::arch::x86_64::_MM_HINT_T0,
-                            );
-                        }
-                    }
-                }
-            }
             let mut w = word;
             while w != 0 {
                 let r = (w_idx << 6) + w.trailing_zeros() as usize;
