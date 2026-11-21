@@ -68,7 +68,9 @@ Unified 48B record replacing 64B `EvRecord`:
 - Open-addressing table (u64 key -> u32 idx) with min-ingest winner,
   sequential per shard, no generic hashbrown.
 
-## Motor reescrito (rama `claude/admiring-knuth-sv8e8w`)
+## Motor reescrito (PR #1, commit `106fd91`)
+
+**Score oficial: 1.42 s** (antes 2.75 s con `ead4d6c`).
 
 Entorno de medición: VM Firecracker compartida, 4 vCPU Xeon 2.1 GHz, 15 GB,
 `NCPU=4`, archivos en page cache. Hay mucho ruido entre corridas (±10–15 %):

@@ -3,9 +3,8 @@
 Implementación nativa en Rust del benchmark `shopping-sessions-4` (reto
 Databricks del Builders Buildathon). Reemplaza el baseline PySpark (~172 s).
 
-**Score oficial vigente: 2.75 s** (motor anterior, commit `ead4d6c`). Este
-README describe el motor reescrito en la rama `claude/admiring-knuth-sv8e8w`; su objetivo es
-bajar de 1.5 s en el scorer oficial. Aún no tiene score oficial.
+**Score oficial vigente: 1.42 s** con el motor reescrito (commit `106fd91`).
+El motor anterior (`ead4d6c`) marcaba 2.75 s.
 
 ## Arquitectura (`src/pipeline.rs`)
 
