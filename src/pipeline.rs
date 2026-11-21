@@ -52,6 +52,7 @@ fn ev_purch(ev: u64) -> bool {
 }
 
 // 16B survivor record: dense person index (canon_shard<<24 | local) + packed event.
+#[derive(Clone, Copy)]
 struct Rec12 {
     ev: u64,
     person_idx: u32,
@@ -116,6 +117,38 @@ const _: () = assert!(std::mem::size_of::<EvRecord>() == 48);
 struct ShardBuf {
     recs: Vec<EvRecord>,
     side: Vec<u8>,
+}
+
+// L1-dTLB staging for the parse scatter: 4 records per shard (192B),
+// flushed as whole blocks instead of 256-way single-record writes.
+struct EvScatter {
+    shards: Vec<ShardBuf>,
+    stage: [[EvRecord; 4]; NUM_SHARDS],
+    stage_n: [u8; NUM_SHARDS],
+}
+
+impl EvScatter {
+    #[inline]
+    fn push(&mut self, shard: usize, rec: EvRecord) {
+        let n = self.stage_n[shard] as usize;
+        self.stage[shard][n] = rec;
+        if n == 3 {
+            self.shards[shard].recs.extend_from_slice(&self.stage[shard]);
+            self.stage_n[shard] = 0;
+        } else {
+            self.stage_n[shard] = (n + 1) as u8;
+        }
+    }
+
+    fn flush(&mut self) {
+        for s in 0..NUM_SHARDS {
+            let n = self.stage_n[s] as usize;
+            if n > 0 {
+                self.shards[s].recs.extend_from_slice(&self.stage[s][..n]);
+                self.stage_n[s] = 0;
+            }
+        }
+    }
 }
 
 impl ShardBuf {
@@ -369,6 +402,11 @@ fn emit_shard(
 ) {
     let t_emit = std::time::Instant::now();
     let mut tmp_a = [0u8; 9];
+    // L1-dTLB staging: 4 records per partition (64B = 1 cache line), flushed
+    // as whole blocks to avoid 256-way random single-record writes.
+    let mut stage: [[Rec12; 4]; NUM_SHARDS] =
+        [[Rec12 { ev: 0, person_idx: 0, _pad: 0 }; 4]; NUM_SHARDS];
+    let mut stage_n: [u8; NUM_SHARDS] = [0; NUM_SHARDS];
     for (b, sb) in bufs.iter().enumerate() {
         for (w_idx, &word) in win_bits[b].iter().enumerate() {
             let mut w = word;
@@ -390,12 +428,26 @@ fn emit_shard(
                 let Some(person_idx) = person_idx else {
                     continue;
                 };
-                parts[(person_idx >> 24) as usize].push(Rec12 {
+                let part = (person_idx >> 24) as usize;
+                stage[part][stage_n[part] as usize] = Rec12 {
                     ev: rec.ev,
                     person_idx,
                     _pad: 0,
-                });
+                };
+                let n = stage_n[part] + 1;
+                if n == 4 {
+                    parts[part].extend_from_slice(&stage[part]);
+                    stage_n[part] = 0;
+                } else {
+                    stage_n[part] = n;
+                }
             }
+        }
+    }
+    for (p, st) in stage.iter().enumerate() {
+        let n = stage_n[p] as usize;
+        if n > 0 {
+            parts[p].extend_from_slice(&st[..n]);
         }
     }
     emit_nanos.fetch_add(
@@ -798,15 +850,26 @@ pub fn run_pipeline(
             &event_paths,
             block_sz,
             threads,
-            move |_| {
-                (0..NUM_SHARDS)
+            move |_| EvScatter {
+                shards: (0..NUM_SHARDS)
                     .map(|_| ShardBuf {
                         recs: Vec::with_capacity(recs_per_shard),
                         side: Vec::new(),
                     })
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>(),
+                stage: [[EvRecord {
+                    key: 0,
+                    ingest_ms: 0,
+                    user_key: 0,
+                    ev: 0,
+                    id_loc: 0,
+                    user_loc: 0,
+                    flags: 0,
+                    _pad: [0; 7],
+                }; 4]; NUM_SHARDS],
+                stage_n: [0; NUM_SHARDS],
             },
-            |shards, line| {
+            |sc, line| {
                 let fields = split_fields_csv::<7>(line);
                 let Some(fields) = fields else {
                     return;
@@ -819,9 +882,9 @@ pub fn run_pipeline(
                     return;
                 };
                 let (key, slow_id) = field_key(event_id, b'e');
-                let sb = &mut shards[(mix64(key) >> 56) as usize];
+                let s_idx = (mix64(key) >> 56) as usize;
                 let id_loc = if slow_id {
-                    sb.put_side(event_id)
+                    sc.shards[s_idx].put_side(event_id)
                 } else {
                     u32::MAX
                 };
@@ -830,7 +893,7 @@ pub fn run_pipeline(
                         Some((user, ev)) => {
                             let (uk, slow_u) = field_key(user, b'u');
                             let ul = if slow_u {
-                                sb.put_side(user)
+                                sc.shards[s_idx].put_side(user)
                             } else {
                                 u32::MAX
                             };
@@ -838,21 +901,25 @@ pub fn run_pipeline(
                         }
                         None => (0, u32::MAX, 0, FLAG_INVALID),
                     };
-                sb.recs.push(EvRecord {
-                    key,
-                    ingest_ms,
-                    user_key,
-                    ev,
-                    id_loc,
-                    user_loc,
-                    flags,
-                    _pad: [0; 7],
-                });
+                sc.push(
+                    s_idx,
+                    EvRecord {
+                        key,
+                        ingest_ms,
+                        user_key,
+                        ev,
+                        id_loc,
+                        user_loc,
+                        flags,
+                        _pad: [0; 7],
+                    },
+                );
             },
         )?;
         let mut flat: Vec<Vec<ShardBuf>> = (0..NUM_SHARDS).map(|_| Vec::new()).collect();
-        for mut ws in worker_shards {
-            for (s, buf) in ws.drain(..).enumerate() {
+        for mut sc in worker_shards {
+            sc.flush();
+            for (s, buf) in sc.shards.drain(..).enumerate() {
                 if !buf.recs.is_empty() {
                     flat[s].push(buf);
                 }
