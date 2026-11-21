@@ -295,6 +295,8 @@ fn dedup_insert_mark(
     bufs: &[ShardBuf],
     tab: &mut DedupTab,
     ins_nanos: &std::sync::atomic::AtomicU64,
+    u_stg: &mut Vec<Vec<u64>>,
+    uslow: &mut Vec<(u64, SmallBytes)>,
 ) -> Vec<Vec<u64>> {
     let est: usize = bufs.iter().map(|b| b.recs.len()).sum();
     tab.reset(est);
@@ -305,6 +307,15 @@ fn dedup_insert_mark(
         for (rec_idx, rec) in sb.recs.iter().enumerate() {
             let key = rec.key;
             let inv = rec.flags & FLAG_INVALID != 0;
+            // Fused user collection (superset of winners): avoids a second
+            // sequential 48B/record sweep just to read user_key.
+            let uk = rec.user_key;
+            if rec.user_loc == u32::MAX && uk != 0 {
+                u_stg[(uk >> 56) as usize].push(uk);
+            } else {
+                let bytes = key_bytes(uk, b'u', &sb.side, rec.user_loc, &mut tmp_a);
+                uslow.push((uk, SmallBytes::from_slice(bytes)));
+            }
             let mut i = (mix64(key) as usize) & tab.mask;
             loop {
                 let v = tab.vals[i];
@@ -358,36 +369,6 @@ fn dedup_insert_mark(
         std::sync::atomic::Ordering::Relaxed,
     );
     win_bits
-}
-
-// Sequential scan over winner bits: stage user_keys per user-shard + slow
-// users as (key, bytes).
-fn collect_users(
-    bufs: &[ShardBuf],
-    win_bits: &[Vec<u64>],
-) -> (Vec<Vec<u64>>, Vec<(u64, SmallBytes)>) {
-    let mut u_stg: Vec<Vec<u64>> = (0..NUM_SHARDS).map(|_| Vec::new()).collect();
-    let mut uslow: Vec<(u64, SmallBytes)> = Vec::new();
-    let mut tmp_a = [0u8; 9];
-    for (b, sb) in bufs.iter().enumerate() {
-        for (w_idx, &word) in win_bits[b].iter().enumerate() {
-            let mut w = word;
-            while w != 0 {
-                let r = (w_idx << 6) + w.trailing_zeros() as usize;
-                w &= w - 1;
-                let rec = &sb.recs[r];
-                let uk = rec.user_key;
-                if rec.user_loc == u32::MAX && uk != 0 {
-                    u_stg[(uk >> 56) as usize].push(uk);
-                } else {
-                    let bytes =
-                        key_bytes(uk, b'u', &sb.side, rec.user_loc, &mut tmp_a);
-                    uslow.push((uk, SmallBytes::from_slice(bytes)));
-                }
-            }
-        }
-    }
-    (u_stg, uslow)
 }
 
 // Phase E: sequential scan over winner bits -> probe map -> 16B
@@ -1089,10 +1070,18 @@ pub fn run_pipeline(
                         static DEDUP_TAB: std::cell::RefCell<DedupTab> =
                             std::cell::RefCell::new(DedupTab::new());
                     }
+                    let mut u_stg: Vec<Vec<u64>> =
+                        (0..NUM_SHARDS).map(|_| Vec::new()).collect();
+                    let mut uslow: Vec<(u64, SmallBytes)> = Vec::new();
                     let bits = DEDUP_TAB.with(|t| {
-                        dedup_insert_mark(bufs, &mut t.borrow_mut(), ins_ref)
+                        dedup_insert_mark(
+                            bufs,
+                            &mut t.borrow_mut(),
+                            ins_ref,
+                            &mut u_stg,
+                            &mut uslow,
+                        )
                     });
-                    let (u_stg, uslow) = collect_users(bufs, &bits);
                     *a_ref[s].lock().unwrap() = Some((bits, u_stg, uslow));
                 });
             }
