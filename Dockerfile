@@ -1,7 +1,7 @@
 FROM rust:1.90-slim-bookworm AS builder
 
 WORKDIR /build
-COPY Cargo.toml ./
+COPY Cargo.toml Cargo.lock ./
 RUN mkdir src && echo "fn main() {}" > src/main.rs && cargo build --release && rm -rf src
 
 COPY src/ ./src/
