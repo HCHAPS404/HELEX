@@ -82,6 +82,7 @@ def bench(seed: int, events: int, clicks: int) -> dict:
         "HOME": scratch, "TMPDIR": scratch,
         "NCPU": "8", "MEM_GB": "24", "DEBUG_BENCH": "1",
         "MIMALLOC_LARGE_OS_PAGES": "1", "MIMALLOC_EAGER_COMMIT": "1",
+        "PARSE_LEVEL": os.environ.get("PARSE_LEVEL", "5"),
     }
     peak = [0]
 

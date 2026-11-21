@@ -1160,8 +1160,15 @@ pub fn run_pipeline(
                     if w_ref[s].is_empty() {
                         return;
                     }
-                    let mut parts: Vec<Vec<Rec16>> =
-                        (0..NUM_SHARDS).map(|_| Vec::new()).collect();
+                    let winners: usize = w_ref[s]
+                        .iter()
+                        .flat_map(|w| w.iter())
+                        .map(|w| w.count_ones() as usize)
+                        .sum();
+                    let per_part = winners / NUM_SHARDS + 64;
+                    let mut parts: Vec<Vec<Rec16>> = (0..NUM_SHARDS)
+                        .map(|_| Vec::with_capacity(per_part))
+                        .collect();
                     emit_shard(
                         &shard_inputs_ref[s][..],
                         &w_ref[s],
