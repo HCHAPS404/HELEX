@@ -66,19 +66,23 @@ ins_cpu map emit_cpu clicks cres events sess parquet total` a stderr
 | `5783ec2` | split hot/cold (REVERTIDO) | 1.69s | **2.94 ❌** |
 | `ead4d6c` | bitmap secuencial + staging + fusión collect→insert | ~1.66s | **2.75 ✅** |
 | `9cf82d4` | revert hot/cold (= `ead4d6c` semánticamente) | — | — |
-| `1004df9` | + prefetch de slots dedup | — | candidato |
+| `1004df9` | + prefetch de slots dedup | — | **3.41 ❌** |
 
-## Lo que el scorer premia / penaliza (¡importante, Alex!)
+> Nota: `1004df9` = mismo código que `ead4d6c` + prefetch de 16 líneas.
+> 2.75 vs 3.41 no se explica por el cambio: o el scorer tiene ruido ±0.3s,
+> o el prefetch perjudica en su CPU. Pendiente: reenviar `ead4d6c` para medir.
 
-El hardware del scorer es mucho más sensible a **patrones de acceso a memoria**
-que a CPU pura:
+## Lo que el scorer parece premiar / penalizar (hipótesis, NO confirmada)
 
-✅ **Premia**: una sola corriente secuencial por pasada, bitmaps en vez de
-accesos aleatorios, writes en bloques (staging), menos sweeps sobre DRAM.
+El hardware del scorer parece más sensible a **patrones de acceso a memoria**
+que a CPU pura (una sola medición por cambio — tomarlo como guía, no como ley):
 
-❌ **Penaliza**: streams intercalados (el split hot/cold 24B+24B leía
-hot[i]+cold[i] por iteración = 2 streams: −0.19s **peor** pese a tocar menos
-bytes), más RSS/páginas comprometidas.
+✅ Candidatos a premiar: una sola corriente secuencial por pasada, bitmaps en
+vez de accesos aleatorios, writes en bloques (staging), menos sweeps sobre DRAM.
+
+❌ Candidatos a penalizar: streams intercalados (el split hot/cold 24B+24B
+leía hot[i]+cold[i] por iteración = 2 streams: −0.19s **peor** pese a tocar
+menos bytes), más RSS/páginas comprometidas.
 
 ## NO hacer (ya medido, no reintentar)
 
@@ -111,7 +115,8 @@ bytes), más RSS/páginas comprometidas.
 2. PGO en Dockerfile (profile-generate → run → profile-use).
 3. `NUM_SHARDS` A/B (menos streams de escritura).
 4. SWAR en parse de timestamps.
-5. Recalibrar `should_spill_events` al layout actual (RSS ~10.8GB a 20M).
+5. Recalibrar `should_spill_events` al layout actual (RSS ~7.4GB a 20M; la
+   reserva por shard está sobredimensionada ×8 — ver plan).
 
 Plan completo por etapas: ver `BENCHMARKS.md` y el historial de commits de
 `HCHAPS404-DEVELOP` (mensajes documentan cada experimento y su resultado).
