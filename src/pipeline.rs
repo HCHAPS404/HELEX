@@ -33,10 +33,24 @@ use crate::parquet_out::{
 use crate::sso::SmallBytes;
 use crate::timestamp::parse_ts_padded;
 
-const S1_BITS: u32 = 10; // event-id dedup shards
-const S1: usize = 1 << S1_BITS;
-const P_BITS: u32 = 8; // person partitions
-const NP: usize = 1 << P_BITS;
+/// Shard counts scale with the input so a dedup shard (~20k records) and a
+/// person partition (~80k records) stay cache-sized.
+#[derive(Clone, Copy)]
+struct Bits {
+    s1: u32,
+    p: u32,
+}
+
+impl Bits {
+    fn for_event_bytes(bytes: u64) -> Self {
+        let est = (bytes / 75).max(1);
+        let lg = |target: u64| 64 - (est / target).max(1).leading_zeros() - 1;
+        Bits {
+            s1: lg(20_000).clamp(6, 12),
+            p: lg(80_000).clamp(4, 10),
+        }
+    }
+}
 
 const DAY_MS: i64 = 86_400_000;
 const LATE_LIMIT_MS: i64 = 86_400_000;
@@ -383,6 +397,7 @@ where
 
 struct P1 {
     worker: usize,
+    bits: Bits,
     ev: Scatter<EvRec>,
     ck: Scatter<CkRec>,
     slow_e: Vec<(u64, Box<[u8]>)>,
@@ -821,7 +836,7 @@ fn parse_event_line(st: &mut P1, fields: &[&[u8]; 7], pc: &PCtx, arena: &Arena) 
     };
     st.ev.push(
         arena,
-        shard_of(key, S1_BITS),
+        shard_of(key, st.bits.s1),
         EvRec {
             key,
             ingest,
@@ -875,7 +890,7 @@ fn parse_click_line(
     };
     st.ck.push(
         arena,
-        shard_of(canon, P_BITS),
+        shard_of(canon, st.bits.p),
         CkRec {
             canon,
             ts,
@@ -932,6 +947,12 @@ pub fn run_pipeline(
     )?;
     let mut tasks: Vec<Task> = Vec::new();
     let chunk = chunk_bytes();
+    let ev_bytes: u64 = files
+        .iter()
+        .filter(|f| f.kind == Kind::Events)
+        .map(|f| f.len)
+        .sum();
+    let bits = Bits::for_event_bytes(ev_bytes);
     // Events first (largest files first), then clicks: links/DSU (needed only
     // by clicks) load while events parse.
     for kind in [Kind::Events, Kind::Clicks] {
@@ -995,8 +1016,9 @@ pub fn run_pipeline(
             threads,
             |w| P1 {
                 worker: w,
-                ev: Scatter::new(S1),
-                ck: Scatter::new(NP),
+                bits,
+                ev: Scatter::new(1 << bits.s1),
+                ck: Scatter::new(1 << bits.p),
                 slow_e: Vec::new(),
                 slow_u: Vec::new(),
                 long_cids: Vec::new(),
@@ -1105,10 +1127,10 @@ pub fn run_pipeline(
         tab: Vec<[u64; 2]>,
     }
     let p2_states = par_tasks(
-        S1,
+        1 << bits.s1,
         threads,
         |_| P2 {
-            out: Scatter::new(NP),
+            out: Scatter::new(1 << bits.p),
             tab: Vec::new(),
         },
         |st, s| {
@@ -1179,7 +1201,7 @@ pub fn run_pipeline(
                             let canon = dsu_r.resolve(r.user);
                             st.out.push(
                                 arena_ref,
-                                shard_of(canon, P_BITS),
+                                shard_of(canon, bits.p),
                                 PRec { canon, ev: r.ev },
                             );
                         }
@@ -1220,7 +1242,7 @@ pub fn run_pipeline(
     let ud = &user_dir;
     let cats = &catalog.categories;
     let p3_states = par_tasks(
-        NP,
+        1 << bits.p,
         threads,
         |w| P3 {
             pmap: KeyMap::with_capacity(1024),
