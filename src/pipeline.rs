@@ -305,6 +305,22 @@ fn dedup_insert_mark(
     let t_ins = std::time::Instant::now();
     for (buf_idx, sb) in bufs.iter().enumerate() {
         for (rec_idx, rec) in sb.recs.iter().enumerate() {
+            // Software prefetch: the dedup slot for a record ~8 ahead, so the
+            // random table probe hits a line already in flight to L1/L2.
+            #[cfg(target_arch = "x86_64")]
+            if let Some(next) = sb.recs.get(rec_idx + 8) {
+                let slot = (mix64(next.key) as usize) & tab.mask;
+                unsafe {
+                    core::arch::x86_64::_mm_prefetch(
+                        tab.vals.as_ptr().add(slot) as *const i8,
+                        core::arch::x86_64::_MM_HINT_T0,
+                    );
+                    core::arch::x86_64::_mm_prefetch(
+                        tab.keys.as_ptr().add(slot) as *const i8,
+                        core::arch::x86_64::_MM_HINT_T0,
+                    );
+                }
+            }
             let key = rec.key;
             let inv = rec.flags & FLAG_INVALID != 0;
             // Fused user collection (superset of winners): avoids a second
