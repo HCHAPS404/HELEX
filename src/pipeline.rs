@@ -114,33 +114,8 @@ struct EvRecord {
 }
 const _: () = assert!(std::mem::size_of::<EvRecord>() == 48);
 
-// Hot/cold record split: dedup insert only touches hot (key/ingest/id_loc),
-// emit only touches cold (user_key/ev/user_loc). Two sequential 24B streams
-// instead of one 48B stream halves the bytes read by each pass.
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct EvHot {
-    key: u64,
-    ingest_ms: i64,
-    id_loc: u32,
-    flags: u8,
-    _pad: [u8; 3],
-}
-const _: () = assert!(std::mem::size_of::<EvHot>() == 24);
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct EvCold {
-    user_key: u64,
-    ev: u64,
-    user_loc: u32,
-    _pad: u32,
-}
-const _: () = assert!(std::mem::size_of::<EvCold>() == 24);
-
 struct ShardBuf {
-    hot: Vec<EvHot>,
-    cold: Vec<EvCold>,
+    recs: Vec<EvRecord>,
     side: Vec<u8>,
 }
 
@@ -158,39 +133,19 @@ impl EvScatter {
         let n = self.stage_n[shard] as usize;
         self.stage[shard][n] = rec;
         if n == 3 {
-            self.stage_n[shard] = 4;
-            self.flush_shard(shard);
+            self.shards[shard].recs.extend_from_slice(&self.stage[shard]);
+            self.stage_n[shard] = 0;
         } else {
             self.stage_n[shard] = (n + 1) as u8;
         }
     }
 
-    #[inline]
-    fn flush_shard(&mut self, s: usize) {
-        let n = self.stage_n[s] as usize;
-        let sb = &mut self.shards[s];
-        for r in &self.stage[s][..n] {
-            sb.hot.push(EvHot {
-                key: r.key,
-                ingest_ms: r.ingest_ms,
-                id_loc: r.id_loc,
-                flags: r.flags,
-                _pad: [0; 3],
-            });
-            sb.cold.push(EvCold {
-                user_key: r.user_key,
-                ev: r.ev,
-                user_loc: r.user_loc,
-                _pad: 0,
-            });
-        }
-        self.stage_n[s] = 0;
-    }
-
     fn flush(&mut self) {
         for s in 0..NUM_SHARDS {
-            if self.stage_n[s] > 0 {
-                self.flush_shard(s);
+            let n = self.stage_n[s] as usize;
+            if n > 0 {
+                self.shards[s].recs.extend_from_slice(&self.stage[s][..n]);
+                self.stage_n[s] = 0;
             }
         }
     }
@@ -199,8 +154,7 @@ impl EvScatter {
 impl ShardBuf {
     fn new() -> Self {
         Self {
-            hot: Vec::new(),
-            cold: Vec::new(),
+            recs: Vec::new(),
             side: Vec::new(),
         }
     }
@@ -344,24 +298,22 @@ fn dedup_insert_mark(
     u_stg: &mut Vec<Vec<u64>>,
     uslow: &mut Vec<(u64, SmallBytes)>,
 ) -> Vec<Vec<u64>> {
-    let est: usize = bufs.iter().map(|b| b.hot.len()).sum();
+    let est: usize = bufs.iter().map(|b| b.recs.len()).sum();
     tab.reset(est);
     let mut tmp_a = [0u8; 9];
     let mut tmp_b = [0u8; 9];
     let t_ins = std::time::Instant::now();
     for (buf_idx, sb) in bufs.iter().enumerate() {
-        for rec_idx in 0..sb.hot.len() {
-            let rec = &sb.hot[rec_idx];
+        for (rec_idx, rec) in sb.recs.iter().enumerate() {
             let key = rec.key;
             let inv = rec.flags & FLAG_INVALID != 0;
             // Fused user collection (superset of winners): avoids a second
-            // sequential sweep just to read user_key.
-            let c = &sb.cold[rec_idx];
-            let uk = c.user_key;
-            if c.user_loc == u32::MAX && uk != 0 {
+            // sequential 48B/record sweep just to read user_key.
+            let uk = rec.user_key;
+            if rec.user_loc == u32::MAX && uk != 0 {
                 u_stg[(uk >> 56) as usize].push(uk);
             } else {
-                let bytes = key_bytes(uk, b'u', &sb.side, c.user_loc, &mut tmp_a);
+                let bytes = key_bytes(uk, b'u', &sb.side, rec.user_loc, &mut tmp_a);
                 uslow.push((uk, SmallBytes::from_slice(bytes)));
             }
             let mut i = (mix64(key) as usize) & tab.mask;
@@ -374,7 +326,7 @@ fn dedup_insert_mark(
                 }
                 if tab.keys[i] == key {
                     let eb = &bufs[(v >> 24) as usize & 0x7F];
-                    let erec = &eb.hot[(v & 0xFF_FFFF) as usize];
+                    let erec = &eb.recs[(v & 0xFF_FFFF) as usize];
                     let same = if rec.id_loc == u32::MAX && erec.id_loc == u32::MAX {
                         true
                     } else {
@@ -401,7 +353,7 @@ fn dedup_insert_mark(
 
     let win_bits: Vec<Vec<u64>> = bufs
         .iter()
-        .map(|b| vec![0u64; b.hot.len() / 64 + 1])
+        .map(|b| vec![0u64; b.recs.len() / 64 + 1])
         .collect();
     let mut win_bits = win_bits;
     for &v in tab.vals.iter() {
@@ -442,7 +394,7 @@ fn emit_shard(
             while w != 0 {
                 let r = (w_idx << 6) + w.trailing_zeros() as usize;
                 w &= w - 1;
-                let rec = &sb.cold[r];
+                let rec = &sb.recs[r];
                 let uk = rec.user_key;
                 let person_idx = if rec.user_loc == u32::MAX && uk != 0 {
                     umaps[(uk >> 56) as usize].get(uk)
@@ -882,8 +834,7 @@ pub fn run_pipeline(
             move |_| EvScatter {
                 shards: (0..NUM_SHARDS)
                     .map(|_| ShardBuf {
-                        hot: Vec::with_capacity(recs_per_shard),
-                        cold: Vec::with_capacity(recs_per_shard),
+                        recs: Vec::with_capacity(recs_per_shard),
                         side: Vec::new(),
                     })
                     .collect::<Vec<_>>(),
@@ -950,7 +901,7 @@ pub fn run_pipeline(
         for mut sc in worker_shards {
             sc.flush();
             for (s, buf) in sc.shards.drain(..).enumerate() {
-                if !buf.hot.is_empty() {
+                if !buf.recs.is_empty() {
                     flat[s].push(buf);
                 }
             }
@@ -1065,19 +1016,7 @@ pub fn run_pipeline(
                         if rec.user_loc != u32::MAX {
                             rec.user_loc += base;
                         }
-                        sb.hot.push(EvHot {
-                            key: rec.key,
-                            ingest_ms: rec.ingest_ms,
-                            id_loc: rec.id_loc,
-                            flags: rec.flags,
-                            _pad: [0; 3],
-                        });
-                        sb.cold.push(EvCold {
-                            user_key: rec.user_key,
-                            ev: rec.ev,
-                            user_loc: rec.user_loc,
-                            _pad: 0,
-                        });
+                        sb.recs.push(rec);
                     }
                     vec![sb]
                 }
