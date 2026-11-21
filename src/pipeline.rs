@@ -533,10 +533,6 @@ pub fn run_pipeline(
     let t_cat = t0.elapsed();
 
     let t1 = std::time::Instant::now();
-    let dsu = crate::dsu::load_links(data_dir, threads)?;
-    let t_dsu = t1.elapsed();
-
-    let t2 = std::time::Instant::now();
     let event_paths = csv_paths(&data_dir.join("events"));
     let total_event_bytes: u64 = event_paths
         .iter()
@@ -546,9 +542,12 @@ pub fn run_pipeline(
     let _est_events = ((total_event_bytes / 68) as usize).max(16);
 
     let catalog_ref = &catalog;
-    let dsu_ref = &dsu;
 
-    let shard_inputs: Vec<Vec<ShardBuf>> = if !spill {
+    // DSU build (links ingest + union) overlaps the events shard ingest:
+    // canonicalization is only needed at dedup emission, not during parse.
+    let (dsu, shard_inputs) = std::thread::scope(|scope| -> io::Result<_> {
+        let dsu_handle = scope.spawn(|| crate::dsu::load_links(data_dir, threads));
+        let inputs: Vec<Vec<ShardBuf>> = if !spill {
         let block_sz = if total_event_bytes >= (64 << 20) {
             4 << 20
         } else {
@@ -725,7 +724,13 @@ pub fn run_pipeline(
             .collect();
         let _ = fs::remove_dir_all(&spill_dir);
         flat
-    };
+        };
+        let dsu = dsu_handle.join().unwrap()?;
+        Ok((dsu, inputs))
+    })?;
+    let dsu_ref = &dsu;
+    let t_dsu = std::time::Duration::ZERO;
+    let t2 = t1;
 
     // Dedup (CPU/RAM-bound) and click CSV ingest (I/O+parse-bound) overlap:
     // dedup runs on a scoped worker while clicks stream through the pool.
