@@ -554,13 +554,17 @@ pub fn run_pipeline(
         } else {
             1 << 20
         };
+        let recs_per_shard = (total_event_bytes as usize / 72 / NUM_SHARDS) + 256;
         let worker_shards = process_csv_files_parallel(
             &event_paths,
             block_sz,
             threads,
-            |_| {
+            move |_| {
                 (0..NUM_SHARDS)
-                    .map(|_| ShardBuf::new())
+                    .map(|_| ShardBuf {
+                        recs: Vec::with_capacity(recs_per_shard),
+                        side: Vec::new(),
+                    })
                     .collect::<Vec<_>>()
             },
             |shards, line, ascii| {
