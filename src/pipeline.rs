@@ -43,7 +43,14 @@ const LATE_LIMIT_MS: i64 = 86_400_000;
 const SESSION_GAP_MS: i64 = 1_800_000;
 const CLICK_REACH_MS: i64 = 7 * DAY_MS;
 
-const CHUNK: u64 = 1 << 20;
+const CHUNK_DEFAULT: u64 = 256 << 10;
+
+fn chunk_bytes() -> u64 {
+    std::env::var("HELEX_CHUNK_KB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map_or(CHUNK_DEFAULT, |kb| (kb.max(4)) << 10)
+}
 const TAIL: u64 = 16 << 10;
 const PAD: usize = 64;
 
@@ -119,9 +126,20 @@ struct PCtx<'a> {
     catalog: &'a Catalog,
     /// fast product key -> category id (first catalog row wins)
     prod: KeyMap,
+    /// fast campaign key -> campaign id
+    camp: KeyMap,
 }
 
 impl PCtx<'_> {
+    #[inline(always)]
+    fn campaign_of(&self, cid: &[u8]) -> Option<u16> {
+        let (k, slow) = unsafe { id_key_padded(cid, b'c') };
+        if slow {
+            return self.catalog.campaign_of(cid);
+        }
+        self.camp.get(k).map(|c| c as u16)
+    }
+
     #[inline(always)]
     fn category_of(&self, product: &[u8]) -> u16 {
         let (k, slow) = unsafe { id_key_padded(product, b'p') };
@@ -817,7 +835,7 @@ fn parse_event_line(st: &mut P1, fields: &[&[u8]; 7], pc: &PCtx, arena: &Arena) 
 fn parse_click_line(
     st: &mut P1,
     fields: &[&[u8]; 4],
-    catalog: &Catalog,
+    pc: &PCtx,
     dsu: &Dsu,
     arena: &Arena,
     click_min_ts: i64,
@@ -829,7 +847,7 @@ fn parse_click_line(
     if click_id.is_empty() || user_raw.is_empty() {
         return;
     }
-    let Some(camp) = catalog.campaign_of(fields[2]) else {
+    let Some(camp) = pc.campaign_of(fields[2]) else {
         return;
     };
     let Some(ts) = (unsafe { parse_ts_padded(fields[3]) }) else {
@@ -913,6 +931,7 @@ pub fn run_pipeline(
         &mut files,
     )?;
     let mut tasks: Vec<Task> = Vec::new();
+    let chunk = chunk_bytes();
     // Events first (largest files first), then clicks: links/DSU (needed only
     // by clicks) load while events parse.
     for kind in [Kind::Events, Kind::Clicks] {
@@ -924,7 +943,7 @@ pub fn run_pipeline(
             let f = &files[i];
             let mut s = f.data_start;
             while s < f.len {
-                let e = (s + CHUNK).min(f.len);
+                let e = (s + chunk).min(f.len);
                 tasks.push(Task {
                     file: i,
                     start: s,
@@ -942,14 +961,24 @@ pub fn run_pipeline(
             prod.get_or_insert(k, u32::from(cat));
         }
     }
+    let mut camp = KeyMap::with_capacity(catalog.campaign_ids.len() + 1);
+    for (i, cid) in catalog.campaign_ids[..catalog.organic_camp_id as usize]
+        .iter()
+        .enumerate()
+    {
+        let (k, slow) = id_key(cid, b'c');
+        if !slow {
+            camp.get_or_insert(k, i as u32);
+        }
+    }
     let pctx = PCtx {
         catalog: &catalog,
         prod,
+        camp,
     };
     let pctx_ref = &pctx;
     let arena = Arena::new();
     let dsu_cell: OnceLock<io::Result<Dsu>> = OnceLock::new();
-    let catalog_ref = &catalog;
     let files_ref = &files;
     let tasks_ref = &tasks;
     let arena_ref = &arena;
@@ -971,7 +1000,7 @@ pub fn run_pipeline(
                 slow_e: Vec::new(),
                 slow_u: Vec::new(),
                 long_cids: Vec::new(),
-                buf: Vec::with_capacity((CHUNK + TAIL + 2) as usize),
+                buf: Vec::with_capacity((chunk + TAIL) as usize + PAD),
                 masks: Masks::default(),
                 err: None,
             },
@@ -1002,7 +1031,7 @@ pub fn run_pipeline(
                                     parse_click_line(
                                         st,
                                         fields,
-                                        catalog_ref,
+                                        pctx_ref,
                                         dsu,
                                         arena_ref,
                                         click_min_ts,

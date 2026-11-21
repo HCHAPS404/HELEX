@@ -9,3 +9,4 @@ requirements.txt
 .git/
 .devin/
 scripts/
+tools/
