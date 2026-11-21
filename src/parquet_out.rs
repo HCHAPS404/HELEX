@@ -4,7 +4,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
-use parquet::basic::{Compression, ConvertedType, Encoding, LogicalType, Repetition, Type as PhysicalType};
+use parquet::basic::{
+    Compression, ConvertedType, Encoding, LogicalType, Repetition, Type as PhysicalType,
+};
 use parquet::data_type::{ByteArray, ByteArrayType, Int32Type, Int64Type};
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use parquet::file::writer::SerializedFileWriter;
@@ -211,45 +213,65 @@ pub fn write_user_daily_part(
             }
         }
 
-        let mut rg = writer.next_row_group().map_err(|e| io::Error::other(e.to_string()))?;
+        let mut rg = writer
+            .next_row_group()
+            .map_err(|e| io::Error::other(e.to_string()))?;
 
         {
-            let mut col = rg.next_column().map_err(|e| io::Error::other(e.to_string()))?.unwrap();
+            let mut col = rg
+                .next_column()
+                .map_err(|e| io::Error::other(e.to_string()))?
+                .unwrap();
             col.typed::<ByteArrayType>()
                 .write_batch(&user_ids, None, None)
                 .map_err(|e| io::Error::other(e.to_string()))?;
             col.close().map_err(|e| io::Error::other(e.to_string()))?;
         }
         {
-            let mut col = rg.next_column().map_err(|e| io::Error::other(e.to_string()))?.unwrap();
+            let mut col = rg
+                .next_column()
+                .map_err(|e| io::Error::other(e.to_string()))?
+                .unwrap();
             col.typed::<Int32Type>()
                 .write_batch(&days, None, None)
                 .map_err(|e| io::Error::other(e.to_string()))?;
             col.close().map_err(|e| io::Error::other(e.to_string()))?;
         }
         {
-            let mut col = rg.next_column().map_err(|e| io::Error::other(e.to_string()))?.unwrap();
+            let mut col = rg
+                .next_column()
+                .map_err(|e| io::Error::other(e.to_string()))?
+                .unwrap();
             col.typed::<Int64Type>()
                 .write_batch(&sessions, None, None)
                 .map_err(|e| io::Error::other(e.to_string()))?;
             col.close().map_err(|e| io::Error::other(e.to_string()))?;
         }
         {
-            let mut col = rg.next_column().map_err(|e| io::Error::other(e.to_string()))?.unwrap();
+            let mut col = rg
+                .next_column()
+                .map_err(|e| io::Error::other(e.to_string()))?
+                .unwrap();
             col.typed::<Int64Type>()
                 .write_batch(&events, None, None)
                 .map_err(|e| io::Error::other(e.to_string()))?;
             col.close().map_err(|e| io::Error::other(e.to_string()))?;
         }
         {
-            let mut col = rg.next_column().map_err(|e| io::Error::other(e.to_string()))?.unwrap();
+            let mut col = rg
+                .next_column()
+                .map_err(|e| io::Error::other(e.to_string()))?
+                .unwrap();
             col.typed::<Int64Type>()
                 .write_batch(&revenues, None, None)
                 .map_err(|e| io::Error::other(e.to_string()))?;
             col.close().map_err(|e| io::Error::other(e.to_string()))?;
         }
         {
-            let mut col = rg.next_column().map_err(|e| io::Error::other(e.to_string()))?.unwrap();
+            let mut col = rg
+                .next_column()
+                .map_err(|e| io::Error::other(e.to_string()))?
+                .unwrap();
             col.typed::<ByteArrayType>()
                 .write_batch(&cat_vals, Some(&cat_defs), None)
                 .map_err(|e| io::Error::other(e.to_string()))?;
@@ -259,7 +281,9 @@ pub fn write_user_daily_part(
         rg.close().map_err(|e| io::Error::other(e.to_string()))?;
     }
 
-    writer.close().map_err(|e| io::Error::other(e.to_string()))?;
+    writer
+        .close()
+        .map_err(|e| io::Error::other(e.to_string()))?;
     Ok(())
 }
 
@@ -289,24 +313,35 @@ pub fn write_campaign_daily(out_dir: &Path, rows: &[CampaignDailyRow]) -> io::Re
             let revs: Vec<i64> = chunk.iter().map(|r| r.revenue_cents).collect();
             let assts: Vec<i64> = chunk.iter().map(|r| r.assisted_sessions).collect();
 
-            let mut rg = writer.next_row_group().map_err(|e| io::Error::other(e.to_string()))?;
+            let mut rg = writer
+                .next_row_group()
+                .map_err(|e| io::Error::other(e.to_string()))?;
 
             for arr in [&cids, &chans] {
-                let mut col = rg.next_column().map_err(|e| io::Error::other(e.to_string()))?.unwrap();
+                let mut col = rg
+                    .next_column()
+                    .map_err(|e| io::Error::other(e.to_string()))?
+                    .unwrap();
                 col.typed::<ByteArrayType>()
                     .write_batch(arr, None, None)
                     .map_err(|e| io::Error::other(e.to_string()))?;
                 col.close().map_err(|e| io::Error::other(e.to_string()))?;
             }
             {
-                let mut col = rg.next_column().map_err(|e| io::Error::other(e.to_string()))?.unwrap();
+                let mut col = rg
+                    .next_column()
+                    .map_err(|e| io::Error::other(e.to_string()))?
+                    .unwrap();
                 col.typed::<Int32Type>()
                     .write_batch(&days, None, None)
                     .map_err(|e| io::Error::other(e.to_string()))?;
                 col.close().map_err(|e| io::Error::other(e.to_string()))?;
             }
             for arr in [&sess, &psess, &revs, &assts] {
-                let mut col = rg.next_column().map_err(|e| io::Error::other(e.to_string()))?.unwrap();
+                let mut col = rg
+                    .next_column()
+                    .map_err(|e| io::Error::other(e.to_string()))?
+                    .unwrap();
                 col.typed::<Int64Type>()
                     .write_batch(arr, None, None)
                     .map_err(|e| io::Error::other(e.to_string()))?;
@@ -317,6 +352,8 @@ pub fn write_campaign_daily(out_dir: &Path, rows: &[CampaignDailyRow]) -> io::Re
         }
     }
 
-    writer.close().map_err(|e| io::Error::other(e.to_string()))?;
+    writer
+        .close()
+        .map_err(|e| io::Error::other(e.to_string()))?;
     Ok(())
 }
