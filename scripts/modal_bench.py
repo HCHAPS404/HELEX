@@ -103,6 +103,27 @@ def bench(seed: int, events: int, clicks: int) -> dict:
     th.join()
     run_s = time.perf_counter() - t1
 
+    # Warm repeats on the same container: the scorer repeats runs and takes a
+    # median, so a single cold number is a noisy proxy for it.
+    warm_runs = []
+    for _ in range(int(os.environ.get("WARM_RUNS", "2"))):
+        wt = time.perf_counter()
+        p = subprocess.Popen(
+            ["shopping-sessions"], env=env,
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        )
+        werr = p.communicate()[1].decode("utf-8", "replace")
+        bench_line = next(
+            (l for l in werr.splitlines() if l.startswith("[bench]")), ""
+        )
+        warm_runs.append(
+            {
+                "run_s": round(time.perf_counter() - wt, 3),
+                "rc": p.returncode,
+                "bench": bench_line.strip(),
+            }
+        )
+
     # I/O floor probe: drop cache again, then sequentially read events CSVs
     # to measure the node's raw disk floor for the input volume.
     for root, _, files in os.walk("/data"):
@@ -130,6 +151,13 @@ def bench(seed: int, events: int, clicks: int) -> dict:
     result = {
         "seed": seed, "events": events, "gen_s": round(gen_s, 2),
         "run_s": round(run_s, 3), "rc": proc.returncode,
+        "warm_runs": warm_runs,
+        "median_run_s": round(
+            sorted([run_s] + [w["run_s"] for w in warm_runs])[
+                len(warm_runs) // 2
+            ],
+            3,
+        ),
         "io_floor_s": round(io_floor, 3),
         "events_mb": round(ev_bytes / 2**20, 1),
         "peak_rss_mib": round(peak[0] / 2**20, 1),

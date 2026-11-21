@@ -1,4 +1,5 @@
 use std::cmp::Reverse;
+use std::env;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
@@ -50,6 +51,10 @@ fn ev_cat(ev: u64) -> u16 {
 fn ev_purch(ev: u64) -> bool {
     ev & 1 != 0
 }
+
+// Diagnostic: PARSE_LEVEL env var truncates event-parse work per line
+// (1=lines only, 2=+field split, 3=+keys/ingest ts, 4=+validate, 5=full).
+static PARSE_LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
 
 // 16B survivor record: dense person index (canon_shard<<24 | local) + packed event.
 #[derive(Clone, Copy)]
@@ -834,7 +839,9 @@ pub fn run_pipeline(
     let (dsu, shard_inputs, t_ingest, t_dsu_wall) = std::thread::scope(|scope| -> io::Result<_> {
         let dsu_handle = scope.spawn(|| {
             let tt = std::time::Instant::now();
-            (crate::dsu::load_links(data_dir, threads), tt)
+            // Links are tiny (~1MB per 1M events): 2 workers suffice; more
+            // just oversubscribes CPUs shared with the event parse pool.
+            (crate::dsu::load_links(data_dir, threads.min(2)), tt)
         });
         let inputs: Vec<Vec<ShardBuf>> = if !spill {
         let block_sz = if total_event_bytes >= (64 << 20) {
@@ -842,7 +849,11 @@ pub fn run_pipeline(
         } else {
             1 << 20
         };
-        let recs_per_shard = (total_event_bytes as usize / 72 / NUM_SHARDS) + 256;
+        // Per-worker shard capacity: dataset estimate is divided across the
+        // worker pool, not reserved in full by each worker (8× over-reserve
+        // produced ~7.4GB RSS for 1.6GB input and OOMed on smaller hosts).
+        let recs_per_shard =
+            (total_event_bytes as usize / 72 / NUM_SHARDS / threads) + 1024;
         let worker_shards = process_csv_files_parallel(
             &event_paths,
             block_sz,
@@ -867,10 +878,26 @@ pub fn run_pipeline(
                 stage_n: [0; NUM_SHARDS],
             },
             |sc, line| {
+                // Diagnostic bisection: PARSE_LEVEL truncates per-line work
+                // (1=lines only, 2=+fields, 3=+keys/ts, 4=+validate, 5=full).
+                let pl = *PARSE_LEVEL.get_or_init(|| {
+                    env::var("PARSE_LEVEL")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(5)
+                });
+                if pl < 2 {
+                    std::hint::black_box(line);
+                    return;
+                }
                 let fields = split_fields_csv::<7>(line);
                 let Some(fields) = fields else {
                     return;
                 };
+                if pl < 3 {
+                    std::hint::black_box(&fields);
+                    return;
+                }
                 let event_id = fields[0];
                 if event_id.is_empty() {
                     return;
@@ -879,6 +906,10 @@ pub fn run_pipeline(
                     return;
                 };
                 let (key, slow_id) = field_key(event_id, b'e');
+                if pl < 4 {
+                    std::hint::black_box(&(key, slow_id, ingest_ms));
+                    return;
+                }
                 let s_idx = (mix64(key) >> 56) as usize;
                 let id_loc = if slow_id {
                     sc.shards[s_idx].put_side(event_id)
@@ -898,6 +929,10 @@ pub fn run_pipeline(
                         }
                         None => (0, u32::MAX, 0, FLAG_INVALID),
                     };
+                if pl < 5 {
+                    std::hint::black_box(&(key, ingest_ms, user_key, ev, flags));
+                    return;
+                }
                 sc.push(
                     s_idx,
                     EvRecord {
@@ -1409,7 +1444,7 @@ pub fn run_pipeline(
         t_clicks_wall = tc.elapsed();
         dedup_handle.join().unwrap()
     });
-    drop(shard_inputs);
+    std::mem::forget(shard_inputs);
     let t_events = t2.elapsed();
     let click_parts = click_parts_res.unwrap()?;
 
