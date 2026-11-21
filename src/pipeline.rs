@@ -727,53 +727,36 @@ pub fn run_pipeline(
         flat
     };
 
-    let surv_slots: Vec<Mutex<Option<Vec<Vec<Survivor>>>>> = (0..NUM_SHARDS)
-        .map(|_| Mutex::new(None))
-        .collect();
+    // Dedup (CPU/RAM-bound) and click CSV ingest (I/O+parse-bound) overlap:
+    // dedup runs on a scoped worker while clicks stream through the pool.
     let shard_inputs_ref = &shard_inputs;
-    let surv_slots_ref = &surv_slots;
-    parallel_for(NUM_SHARDS, threads, |s| {
-        let bufs = &shard_inputs_ref[s];
-        if bufs.is_empty() {
-            return;
-        }
-        let est = bufs.iter().map(|b| b.recs.len()).sum::<usize>().max(64);
-        let mut table = HashTable::with_capacity(est * 2);
-        let mut slots: Vec<ShardDedupSlot> = Vec::with_capacity(est);
-        let mut parts: Vec<Vec<Survivor>> =
-            (0..NUM_SHARDS).map(|_| Vec::new()).collect();
-        dedup_one_shard(bufs, dsu_ref, &mut table, &mut slots, &mut parts);
-        *surv_slots_ref[s].lock().unwrap() = Some(parts);
-    });
-    let survivors: Vec<Vec<Vec<Survivor>>> = surv_slots
-        .into_iter()
-        .map(|m| m.into_inner().unwrap().unwrap_or_default())
-        .collect();
-    drop(shard_inputs);
-
-    // Bloom filter over canonical persons with >=1 surviving event; rejects
-    // clicks whose user has no events before they touch partition vectors.
-    const BLOOM_BITS: usize = 1 << 24;
-    let mut bloom = vec![0u64; BLOOM_BITS / 64];
-    for sp in &survivors {
-        for part in sp {
-            for s in part {
-                let h = s.person_hash;
-                let m = BLOOM_BITS - 1;
-                let b1 = (h as usize) & m;
-                let b2 = ((h >> 32) as usize ^ (h as usize >> 16)) & m;
-                let b3 = (h.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40) as usize & m;
-                bloom[b1 >> 6] |= 1u64 << (b1 & 63);
-                bloom[b2 >> 6] |= 1u64 << (b2 & 63);
-                bloom[b3 >> 6] |= 1u64 << (b3 & 63);
-            }
-        }
-    }
-    let t_events = t2.elapsed();
-
-    let t3 = std::time::Instant::now();
+    let mut click_parts_res: Option<io::Result<Vec<Vec<Vec<ClickCand>>>>> = None;
     let click_min_ts = catalog.window_start - CLICK_REACH_MS;
-    let click_parts: Vec<Vec<Vec<ClickCand>>> = {
+    let survivors: Vec<Vec<Vec<Survivor>>> = std::thread::scope(|scope| {
+        let dedup_handle = scope.spawn(|| {
+            let surv_slots: Vec<Mutex<Option<Vec<Vec<Survivor>>>>> = (0..NUM_SHARDS)
+                .map(|_| Mutex::new(None))
+                .collect();
+            let surv_slots_ref = &surv_slots;
+            parallel_for(NUM_SHARDS, threads, |s| {
+                let bufs = &shard_inputs_ref[s];
+                if bufs.is_empty() {
+                    return;
+                }
+                let est = bufs.iter().map(|b| b.recs.len()).sum::<usize>().max(64);
+                let mut table = HashTable::with_capacity(est * 2);
+                let mut slots: Vec<ShardDedupSlot> = Vec::with_capacity(est);
+                let mut parts: Vec<Vec<Survivor>> =
+                    (0..NUM_SHARDS).map(|_| Vec::new()).collect();
+                dedup_one_shard(bufs, dsu_ref, &mut table, &mut slots, &mut parts);
+                *surv_slots_ref[s].lock().unwrap() = Some(parts);
+            });
+            surv_slots
+                .into_iter()
+                .map(|m| m.into_inner().unwrap().unwrap_or_default())
+                .collect::<Vec<Vec<Vec<Survivor>>>>()
+        });
+        click_parts_res = Some((|| -> io::Result<Vec<Vec<Vec<ClickCand>>>> {
         let click_paths = csv_paths(&data_dir.join("clicks"));
         let total_click_bytes: u64 = click_paths
             .iter()
@@ -785,7 +768,6 @@ pub fn run_pipeline(
             1 << 20
         };
         let window_end = catalog.window_end;
-        let bloom_ref = &bloom;
         let worker_parts = process_csv_files_parallel(
             &click_paths,
             block_sz,
@@ -817,18 +799,7 @@ pub fn run_pipeline(
                     return;
                 }
                 let person = SmallBytes::from_slice(dsu_ref.resolve(user_raw));
-                let ph = person.hash64();
-                let m = BLOOM_BITS - 1;
-                let b1 = (ph as usize) & m;
-                let b2 = ((ph >> 32) as usize ^ (ph as usize >> 16)) & m;
-                let b3 = (ph.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40) as usize & m;
-                if bloom_ref[b1 >> 6] & (1u64 << (b1 & 63)) == 0
-                    || bloom_ref[b2 >> 6] & (1u64 << (b2 & 63)) == 0
-                    || bloom_ref[b3 >> 6] & (1u64 << (b3 & 63)) == 0
-                {
-                    return;
-                }
-                parts[(ph >> 56) as usize].push(ClickCand {
+                parts[(person.hash64() >> 56) as usize].push(ClickCand {
                     person,
                     ts,
                     click_id: SmallBytes::from_slice(click_id),
@@ -836,18 +807,23 @@ pub fn run_pipeline(
                 });
             },
         )?;
-        let mut flat: Vec<Vec<Vec<ClickCand>>> =
-            (0..NUM_SHARDS).map(|_| Vec::new()).collect();
-        for mut wp in worker_parts {
-            for (p, bucket) in wp.drain(..).enumerate() {
-                if !bucket.is_empty() {
-                    flat[p].push(bucket);
+            let mut flat: Vec<Vec<Vec<ClickCand>>> =
+                (0..NUM_SHARDS).map(|_| Vec::new()).collect();
+            for mut wp in worker_parts {
+                for (p, bucket) in wp.drain(..).enumerate() {
+                    if !bucket.is_empty() {
+                        flat[p].push(bucket);
+                    }
                 }
             }
-        }
-        flat
-    };
-    let t_clicks = t3.elapsed();
+            Ok(flat)
+        })());
+        dedup_handle.join().unwrap()
+    });
+    drop(shard_inputs);
+    let t_events = t2.elapsed();
+    let click_parts = click_parts_res.unwrap()?;
+    let t_clicks = std::time::Duration::ZERO;
 
     let t4 = std::time::Instant::now();
     let part_slots: Vec<Mutex<Option<PartResult>>> =

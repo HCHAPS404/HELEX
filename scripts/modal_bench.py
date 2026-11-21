@@ -34,7 +34,7 @@ if ARGS.generator_dir:
         .add_local_file(os.path.join(REPO, "Cargo.lock"), "/build/Cargo.lock", copy=True)
         .add_local_dir(ARGS.generator_dir, "/gen", copy=True)
         .run_commands(
-            "cd /build && cargo build --release",
+            'cd /build && RUSTFLAGS="-C target-cpu=x86-64-v2" cargo build --release',
             "cp /build/target/release/shopping-sessions /usr/local/bin/",
             "cd /gen && cargo build --release && cp target/release/generate /usr/local/bin/",
         )

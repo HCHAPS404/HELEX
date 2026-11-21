@@ -1,5 +1,6 @@
 FROM rust:1.90-slim-bookworm AS builder
 
+ENV RUSTFLAGS="-C target-cpu=x86-64-v2"
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir src && echo "fn main() {}" > src/main.rs && cargo build --release && rm -rf src
