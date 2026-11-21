@@ -248,15 +248,21 @@ impl DedupTab {
     }
 }
 
-// Phase A: insert all records into the shard dedup table, then sweep winners.
-// Returns (winner locs [buf:8|rec:24], staged user_keys per user-shard,
-// slow users as (key, bytes)). Winners are only the valid copies; invalid
-// winners are dropped here so emit never sees them.
-fn dedup_insert_collect(
+// vals entry: [invalid:1 | buf:7 | rec:24] — the invalid flag travels in the
+// entry so the winner sweep never touches records.
+#[inline]
+fn pack_loc(invalid: bool, buf_idx: usize, rec_idx: usize) -> u32 {
+    ((invalid as u32) << 31) | ((buf_idx as u32) << 24) | rec_idx as u32
+}
+
+// Phase A: insert all records, then mark winner bits. Returns one u64 bitset
+// per buf (bit r = record r is a valid winner). Sequential emit/collect passes
+// replace random record lookups.
+fn dedup_insert_mark(
     bufs: &[ShardBuf],
     tab: &mut DedupTab,
     ins_nanos: &std::sync::atomic::AtomicU64,
-) -> (Vec<u32>, Vec<Vec<u64>>, Vec<(u64, SmallBytes)>) {
+) -> Vec<Vec<u64>> {
     let est: usize = bufs.iter().map(|b| b.recs.len()).sum();
     tab.reset(est);
     let mut tmp_a = [0u8; 9];
@@ -265,16 +271,17 @@ fn dedup_insert_collect(
     for (buf_idx, sb) in bufs.iter().enumerate() {
         for (rec_idx, rec) in sb.recs.iter().enumerate() {
             let key = rec.key;
+            let inv = rec.flags & FLAG_INVALID != 0;
             let mut i = (mix64(key) as usize) & tab.mask;
             loop {
                 let v = tab.vals[i];
                 if v == EMPTY_LOC {
                     tab.keys[i] = key;
-                    tab.vals[i] = ((buf_idx as u32) << 24) | rec_idx as u32;
+                    tab.vals[i] = pack_loc(inv, buf_idx, rec_idx);
                     break;
                 }
                 if tab.keys[i] == key {
-                    let eb = &bufs[(v >> 24) as usize];
+                    let eb = &bufs[(v >> 24) as usize & 0x7F];
                     let erec = &eb.recs[(v & 0xFF_FFFF) as usize];
                     let same = if rec.id_loc == u32::MAX && erec.id_loc == u32::MAX {
                         true
@@ -290,7 +297,7 @@ fn dedup_insert_collect(
                     };
                     if same {
                         if rec.ingest_ms < erec.ingest_ms {
-                            tab.vals[i] = ((buf_idx as u32) << 24) | rec_idx as u32;
+                            tab.vals[i] = pack_loc(inv, buf_idx, rec_idx);
                         }
                         break;
                     }
@@ -299,41 +306,62 @@ fn dedup_insert_collect(
             }
         }
     }
+
+    let win_bits: Vec<Vec<u64>> = bufs
+        .iter()
+        .map(|b| vec![0u64; b.recs.len() / 64 + 1])
+        .collect();
+    let mut win_bits = win_bits;
+    for &v in tab.vals.iter() {
+        if v == EMPTY_LOC || v >> 31 != 0 {
+            continue;
+        }
+        let b = ((v >> 24) & 0x7F) as usize;
+        let r = (v & 0xFF_FFFF) as usize;
+        win_bits[b][r >> 6] |= 1u64 << (r & 63);
+    }
     ins_nanos.fetch_add(
         t_ins.elapsed().as_nanos() as u64,
         std::sync::atomic::Ordering::Relaxed,
     );
-
-    let mut winners: Vec<u32> = Vec::with_capacity(tab.vals.len() / 2);
-    let mut u_stg: Vec<Vec<u64>> = (0..NUM_SHARDS).map(|_| Vec::new()).collect();
-    let mut uslow: Vec<(u64, SmallBytes)> = Vec::new();
-    for &v in tab.vals.iter() {
-        if v == EMPTY_LOC {
-            continue;
-        }
-        let sb = &bufs[(v >> 24) as usize];
-        let rec = &sb.recs[(v & 0xFF_FFFF) as usize];
-        if rec.flags & FLAG_INVALID != 0 {
-            continue;
-        }
-        winners.push(v);
-        let uk = rec.user_key;
-        if rec.user_loc == u32::MAX && uk != 0 {
-            u_stg[(uk >> 56) as usize].push(uk);
-        } else {
-            let bytes =
-                key_bytes(uk, b'u', &sb.side, rec.user_loc, &mut tmp_a);
-            uslow.push((uk, SmallBytes::from_slice(bytes)));
-        }
-    }
-    (winners, u_stg, uslow)
+    win_bits
 }
 
-// Phase E: emit winners as 16B (person_idx | ev) records into person
-// partitions (partition = person_idx >> 24 = canon shard).
-fn emit_shard(
-    winners: &[u32],
+// Sequential scan over winner bits: stage user_keys per user-shard + slow
+// users as (key, bytes).
+fn collect_users(
     bufs: &[ShardBuf],
+    win_bits: &[Vec<u64>],
+) -> (Vec<Vec<u64>>, Vec<(u64, SmallBytes)>) {
+    let mut u_stg: Vec<Vec<u64>> = (0..NUM_SHARDS).map(|_| Vec::new()).collect();
+    let mut uslow: Vec<(u64, SmallBytes)> = Vec::new();
+    let mut tmp_a = [0u8; 9];
+    for (b, sb) in bufs.iter().enumerate() {
+        for (w_idx, &word) in win_bits[b].iter().enumerate() {
+            let mut w = word;
+            while w != 0 {
+                let r = (w_idx << 6) + w.trailing_zeros() as usize;
+                w &= w - 1;
+                let rec = &sb.recs[r];
+                let uk = rec.user_key;
+                if rec.user_loc == u32::MAX && uk != 0 {
+                    u_stg[(uk >> 56) as usize].push(uk);
+                } else {
+                    let bytes =
+                        key_bytes(uk, b'u', &sb.side, rec.user_loc, &mut tmp_a);
+                    uslow.push((uk, SmallBytes::from_slice(bytes)));
+                }
+            }
+        }
+    }
+    (u_stg, uslow)
+}
+
+// Phase E: sequential scan over winner bits -> probe map -> 16B
+// (person_idx | ev) records into person partitions (part = person_idx >> 24).
+fn emit_shard(
+    bufs: &[ShardBuf],
+    win_bits: &[Vec<u64>],
     umaps: &[UMap],
     slow_umaps: &[Vec<SlowUser>],
     parts: &mut Vec<Vec<Rec12>>,
@@ -341,27 +369,34 @@ fn emit_shard(
 ) {
     let t_emit = std::time::Instant::now();
     let mut tmp_a = [0u8; 9];
-    for &v in winners {
-        let sb = &bufs[(v >> 24) as usize];
-        let rec = &sb.recs[(v & 0xFF_FFFF) as usize];
-        let uk = rec.user_key;
-        let person_idx = if rec.user_loc == u32::MAX && uk != 0 {
-            umaps[(uk >> 56) as usize].get(uk)
-        } else {
-            let bytes = key_bytes(uk, b'u', &sb.side, rec.user_loc, &mut tmp_a);
-            slow_umaps[(uk >> 56) as usize]
-                .iter()
-                .find(|s| s.key == uk && s.bytes.as_slice() == bytes)
-                .map(|s| s.person_idx)
-        };
-        let Some(person_idx) = person_idx else {
-            continue;
-        };
-        parts[(person_idx >> 24) as usize].push(Rec12 {
-            ev: rec.ev,
-            person_idx,
-            _pad: 0,
-        });
+    for (b, sb) in bufs.iter().enumerate() {
+        for (w_idx, &word) in win_bits[b].iter().enumerate() {
+            let mut w = word;
+            while w != 0 {
+                let r = (w_idx << 6) + w.trailing_zeros() as usize;
+                w &= w - 1;
+                let rec = &sb.recs[r];
+                let uk = rec.user_key;
+                let person_idx = if rec.user_loc == u32::MAX && uk != 0 {
+                    umaps[(uk >> 56) as usize].get(uk)
+                } else {
+                    let bytes =
+                        key_bytes(uk, b'u', &sb.side, rec.user_loc, &mut tmp_a);
+                    slow_umaps[(uk >> 56) as usize]
+                        .iter()
+                        .find(|s| s.key == uk && s.bytes.as_slice() == bytes)
+                        .map(|s| s.person_idx)
+                };
+                let Some(person_idx) = person_idx else {
+                    continue;
+                };
+                parts[(person_idx >> 24) as usize].push(Rec12 {
+                    ev: rec.ev,
+                    person_idx,
+                    _pad: 0,
+                });
+            }
+        }
     }
     emit_nanos.fetch_add(
         t_emit.elapsed().as_nanos() as u64,
@@ -971,8 +1006,8 @@ pub fn run_pipeline(
         std::thread::scope(|scope| {
         let dedup_handle = scope.spawn(|| {
             let td = std::time::Instant::now();
-            // Phase A: per-shard dedup insert + winner/user-key collect.
-            type AOut = (Vec<u32>, Vec<Vec<u64>>, Vec<(u64, SmallBytes)>);
+            // Phase A: per-shard dedup insert + winner bits + user collect.
+            type AOut = (Vec<Vec<u64>>, Vec<Vec<u64>>, Vec<(u64, SmallBytes)>);
             let a_slots: Vec<Mutex<Option<AOut>>> = (0..NUM_SHARDS)
                 .map(|_| Mutex::new(None))
                 .collect();
@@ -987,25 +1022,26 @@ pub fn run_pipeline(
                         static DEDUP_TAB: std::cell::RefCell<DedupTab> =
                             std::cell::RefCell::new(DedupTab::new());
                     }
-                    let out = DEDUP_TAB.with(|t| {
-                        dedup_insert_collect(bufs, &mut t.borrow_mut(), ins_ref)
+                    let bits = DEDUP_TAB.with(|t| {
+                        dedup_insert_mark(bufs, &mut t.borrow_mut(), ins_ref)
                     });
-                    *a_ref[s].lock().unwrap() = Some(out);
+                    let (u_stg, uslow) = collect_users(bufs, &bits);
+                    *a_ref[s].lock().unwrap() = Some((bits, u_stg, uslow));
                 });
             }
             let t_a = td.elapsed();
 
-            let mut winners: Vec<Vec<u32>> = Vec::with_capacity(NUM_SHARDS);
+            let mut win_bits: Vec<Vec<Vec<u64>>> = Vec::with_capacity(NUM_SHARDS);
             let mut u_lists: Vec<Vec<u64>> =
                 (0..NUM_SHARDS).map(|_| Vec::new()).collect();
             let mut slow_lists: Vec<Vec<(u64, SmallBytes)>> =
                 (0..NUM_SHARDS).map(|_| Vec::new()).collect();
             for m in a_slots {
-                let Some((w, u_stg, uslow)) = m.into_inner().unwrap() else {
-                    winners.push(Vec::new());
+                let Some((bits, u_stg, uslow)) = m.into_inner().unwrap() else {
+                    win_bits.push(Vec::new());
                     continue;
                 };
-                winners.push(w);
+                win_bits.push(bits);
                 for (u, v) in u_stg.into_iter().enumerate() {
                     if !v.is_empty() {
                         u_lists[u].extend_from_slice(&v);
@@ -1206,7 +1242,7 @@ pub fn run_pipeline(
                 .collect();
             {
                 let p_ref = &p_slots;
-                let w_ref = &winners;
+                let w_ref = &win_bits;
                 let um_ref = &umaps;
                 let su_ref = &slow_umaps;
                 parallel_for(NUM_SHARDS, threads, |s| {
@@ -1216,8 +1252,8 @@ pub fn run_pipeline(
                     let mut parts: Vec<Vec<Rec12>> =
                         (0..NUM_SHARDS).map(|_| Vec::new()).collect();
                     emit_shard(
-                        &w_ref[s],
                         &shard_inputs_ref[s][..],
+                        &w_ref[s],
                         um_ref,
                         su_ref,
                         &mut parts,
