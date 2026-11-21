@@ -211,9 +211,19 @@ fn key_bytes<'a>(
     }
 }
 
+// Multiplicative hash with a high->low fold: keys built from big-endian
+// short ids have all-zero low bytes, so the raw product's low bits (used as
+// table slots) must be mixed with its high bits.
 #[inline]
 fn mix64(x: u64) -> u64 {
-    x.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+    let h = (x ^ (x >> 31)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    h ^ (h >> 29)
+}
+
+// Shard of a u64 key (event id, user, canonical person): top byte of mix64.
+#[inline]
+fn shard_of(k: u64) -> usize {
+    (mix64(k) >> 56) as usize
 }
 
 #[inline]
@@ -327,7 +337,7 @@ fn dedup_insert_mark(
             // sequential 48B/record sweep just to read user_key.
             let uk = rec.user_key;
             if rec.user_loc == u32::MAX && uk != 0 {
-                u_stg[(uk >> 56) as usize].push(uk);
+                u_stg[shard_of(uk)].push(uk);
             } else {
                 let bytes = key_bytes(uk, b'u', &sb.side, rec.user_loc, &mut tmp_a);
                 uslow.push((uk, SmallBytes::from_slice(bytes)));
@@ -413,11 +423,11 @@ fn emit_shard(
                 let rec = &sb.recs[r];
                 let uk = rec.user_key;
                 let person_idx = if rec.user_loc == u32::MAX && uk != 0 {
-                    umaps[(uk >> 56) as usize].get(uk)
+                    umaps[shard_of(uk)].get(uk)
                 } else {
                     let bytes =
                         key_bytes(uk, b'u', &sb.side, rec.user_loc, &mut tmp_a);
-                    slow_umaps[(uk >> 56) as usize]
+                    slow_umaps[shard_of(uk)]
                         .iter()
                         .find(|s| s.key == uk && s.bytes.as_slice() == bytes)
                         .map(|s| s.person_idx)
@@ -879,7 +889,7 @@ pub fn run_pipeline(
                     return;
                 };
                 let (key, slow_id) = field_key(event_id, b'e');
-                let s_idx = (mix64(key) >> 56) as usize;
+                let s_idx = shard_of(key);
                 let id_loc = if slow_id {
                     sc.shards[s_idx].put_side(event_id)
                 } else {
@@ -957,7 +967,7 @@ pub fn run_pipeline(
                     return;
                 };
                 let (key, slow_id) = field_key(event_id, b'e');
-                let shard = (mix64(key) >> 56) as usize;
+                let shard = shard_of(key);
                 let id_loc = if slow_id {
                     tmp.put_side(event_id)
                 } else {
@@ -1120,7 +1130,7 @@ pub fn run_pipeline(
                     }
                 }
                 for (k, b) in uslow {
-                    slow_lists[(k >> 56) as usize].push((k, b));
+                    slow_lists[shard_of(k)].push((k, b));
                 }
             }
 
@@ -1150,7 +1160,7 @@ pub fn run_pipeline(
                         };
                         let canon = dsu_ref.resolve(bytes);
                         let (ck, cslow) = field_key(canon, b'u');
-                        let c = (ck >> 56) as usize;
+                        let c = shard_of(ck);
                         if !cslow && ck != 0 && ubytes.as_slice().is_empty() {
                             pf[c].lock().unwrap().push((ck, user_key));
                         } else {
@@ -1207,7 +1217,7 @@ pub fn run_pipeline(
                         let local = shard.intern(ck, &cb, false);
                         let pidx = ((c as u32) << 24) | local;
                         while i < fast.len() && fast[i].0 == ck {
-                            ufill[(fast[i].1 >> 56) as usize].push((fast[i].1, pidx));
+                            ufill[shard_of(fast[i].1)].push((fast[i].1, pidx));
                             i += 1;
                         }
                     }
@@ -1234,7 +1244,7 @@ pub fn run_pipeline(
                                 || slow[j].canon_bytes.as_slice() == cb.as_slice())
                         {
                             let e = &slow[j];
-                            let u = (e.user_key >> 56) as usize;
+                            let u = shard_of(e.user_key);
                             if e.user_bytes.as_slice().is_empty() {
                                 ufill[u].push((e.user_key, pidx));
                             } else {
@@ -1387,7 +1397,7 @@ pub fn run_pipeline(
                     return;
                 }
                 let (uk, _slow_u) = field_key(user_raw, b'u');
-                parts[(uk >> 56) as usize].push(ClickCand {
+                parts[shard_of(uk)].push(ClickCand {
                     user: SmallBytes::from_slice(user_raw),
                     ts,
                     click_id: SmallBytes::from_slice(click_id),
@@ -1432,7 +1442,7 @@ pub fn run_pipeline(
             let canon_lookup = |user: &[u8]| -> Option<u32> {
                 let canon = dsu_ref.resolve(user);
                 let (ck, cslow) = field_key(canon, b'u');
-                let c = (ck >> 56) as usize;
+                let c = shard_of(ck);
                 cs_ref[c]
                     .get(ck, canon, cslow || ck == 0)
                     .map(|local| ((c as u32) << 24) | local)
