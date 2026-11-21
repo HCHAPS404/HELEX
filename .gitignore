@@ -7,3 +7,4 @@ rules.md
 .venv/
 __pycache__/
 *.pyc
+generator_extracted/
