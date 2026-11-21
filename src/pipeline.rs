@@ -80,25 +80,30 @@ struct CampDayAgg {
     assisted_sessions: i64,
 }
 
-const LONG_TAG: u8 = 0xFF;
-const INVALID_TAG: u8 = 0xFE;
-const INVALID_LOC: u64 = u64::MAX;
+const ID_TAG: u64 = 1 << 63;
+const FLAG_INVALID: u8 = 1;
+const EMPTY_LOC: u32 = u32::MAX;
 
-// Fixed 64-byte dedup record: ids/users <=15B inline, longer values spill to
-// the per-shard side arena encoded as off:u32|len:u32.
+// 48-byte dedup record. event_id/user_id encode to exact u64 keys when they
+// match the generator's shape (prefix byte + <=8 ASCII payload bytes):
+//   key = be(payload) | ID_TAG   for  prefix + len in 2..=9
+//   key = be(field)             for  len <= 8 with b0 < 0x80
+// Otherwise hash64 + the raw bytes live in the shard side arena at *_loc
+// ([u32 len][bytes]). u64 equality is exact for inline keys; byte-compare is
+// only needed when a *_loc side reference is present.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct EvRecord {
-    ev_hash: u64,
+    key: u64,
     ingest_ms: i64,
-    id_len: u8,
-    user_len: u8,
-    _pad: [u8; 6],
-    id: [u8; 16],
-    user: [u8; 16],
+    user_key: u64,
     ev: u64,
+    id_loc: u32,
+    user_loc: u32,
+    flags: u8,
+    _pad: [u8; 7],
 }
-const _: () = assert!(std::mem::size_of::<EvRecord>() == 64);
+const _: () = assert!(std::mem::size_of::<EvRecord>() == 48);
 
 struct ShardBuf {
     recs: Vec<EvRecord>,
@@ -114,29 +119,60 @@ impl ShardBuf {
     }
 
     #[inline]
-    fn put_field(&mut self, raw: &[u8], inline: &mut [u8; 16], len_tag: &mut u8) {
-        if raw.len() <= 15 {
-            inline[..raw.len()].copy_from_slice(raw);
-            *len_tag = raw.len() as u8;
-        } else {
-            let off = self.side.len() as u32;
-            self.side.extend_from_slice(raw);
-            inline[..4].copy_from_slice(&off.to_le_bytes());
-            inline[4..8].copy_from_slice(&(raw.len() as u32).to_le_bytes());
-            *len_tag = LONG_TAG;
-        }
+    fn put_side(&mut self, raw: &[u8]) -> u32 {
+        let off = self.side.len() as u32;
+        self.side
+            .extend_from_slice(&(raw.len() as u32).to_le_bytes());
+        self.side.extend_from_slice(raw);
+        off
     }
 }
 
 #[inline]
-fn field_bytes<'a>(buf: &'a ShardBuf, raw: &'a [u8; 16], len_tag: u8) -> &'a [u8] {
-    if len_tag == LONG_TAG {
-        let off = u32::from_le_bytes(raw[..4].try_into().unwrap()) as usize;
-        let len = u32::from_le_bytes(raw[4..8].try_into().unwrap()) as usize;
-        &buf.side[off..off + len]
+fn field_key(f: &[u8], prefix: u8) -> (u64, bool) {
+    let n = f.len();
+    if n >= 2 && n <= 9 && f[0] == prefix && f[1] < 0x80 && memchr::memchr(0, &f[1..]).is_none()
+    {
+        let mut b = [0u8; 8];
+        b[..n - 1].copy_from_slice(&f[1..]);
+        (u64::from_be_bytes(b) | ID_TAG, false)
+    } else if n >= 1 && n <= 8 && f[0] < 0x80 && memchr::memchr(0, f).is_none() {
+        let mut b = [0u8; 8];
+        b[..n].copy_from_slice(f);
+        (u64::from_be_bytes(b), false)
     } else {
-        &raw[..len_tag as usize]
+        (hash64_bytes(f), true)
     }
+}
+
+#[inline]
+fn key_bytes<'a>(
+    key: u64,
+    prefix: u8,
+    side: &'a [u8],
+    loc: u32,
+    tmp: &'a mut [u8; 9],
+) -> &'a [u8] {
+    if loc != u32::MAX {
+        let o = loc as usize;
+        let len = u32::from_le_bytes(side[o..o + 4].try_into().unwrap()) as usize;
+        return &side[o + 4..o + 4 + len];
+    }
+    let b = (key & !ID_TAG).to_be_bytes();
+    let n = 8 - b.iter().rev().take_while(|&&x| x == 0).count();
+    if key & ID_TAG != 0 {
+        tmp[0] = prefix;
+        tmp[1..1 + n].copy_from_slice(&b[..n]);
+        &tmp[..1 + n]
+    } else {
+        tmp[..n].copy_from_slice(&b[..n]);
+        &tmp[..n]
+    }
+}
+
+#[inline]
+fn mix64(x: u64) -> u64 {
+    x.wrapping_mul(0x9E37_79B9_7F4A_7C15)
 }
 
 #[inline]
@@ -174,82 +210,102 @@ fn validate_event_copy<'a>(
     Some((user_raw, pack_ev(rel_ms, price_cents, cat_id, is_purchase)))
 }
 
-struct ShardDedupSlot {
-    ev_hash: u64,
-    min_ingest_ts: i64,
-    id_len: u32,
-    rec_loc: u64,
-    valid_loc: u64,
+// Open-addressing dedup table: keys[i] is the record's u64 key, vals[i] packs
+// [buf:8 | rec:24]. Winner is the copy with minimum ingest_ms; emit skips it
+// if that copy is invalid. Inline (loc == MAX) keys compare by value alone.
+struct DedupTab {
+    keys: Vec<u64>,
+    vals: Vec<u32>,
+    mask: usize,
 }
 
-#[inline]
-fn rec_loc(buf_idx: usize, rec_idx: usize) -> u64 {
-    ((buf_idx as u64) << 32) | rec_idx as u64
+impl DedupTab {
+    fn new() -> Self {
+        Self {
+            keys: Vec::new(),
+            vals: Vec::new(),
+            mask: 0,
+        }
+    }
+
+    #[inline]
+    fn reset(&mut self, est: usize) {
+        let cap = (est * 2).next_power_of_two().max(64);
+        if self.keys.len() != cap {
+            self.keys.resize(cap, 0);
+            self.vals.resize(cap, EMPTY_LOC);
+        }
+        self.vals.fill(EMPTY_LOC);
+        self.mask = cap - 1;
+    }
 }
 
 fn dedup_one_shard(
     bufs: &[ShardBuf],
     dsu: &UnionFind,
-    table: &mut HashTable<usize>,
-    slots: &mut Vec<ShardDedupSlot>,
+    tab: &mut DedupTab,
     parts: &mut Vec<Vec<Survivor>>,
 ) {
-    table.clear();
-    slots.clear();
-    for (buf_idx, shard_buf) in bufs.iter().enumerate() {
-        for (rec_idx, rec) in shard_buf.recs.iter().enumerate() {
-            let ev_id = field_bytes(shard_buf, &rec.id, rec.id_len);
-            let id_len = ev_id.len() as u32;
-
-            if let Some(&slot_idx) = table.find(rec.ev_hash, |&idx| {
-                let s = &slots[idx];
-                if s.ev_hash != rec.ev_hash || s.id_len != id_len {
-                    return false;
+    let est: usize = bufs.iter().map(|b| b.recs.len()).sum();
+    tab.reset(est);
+    let mut tmp_a = [0u8; 9];
+    let mut tmp_b = [0u8; 9];
+    for (buf_idx, sb) in bufs.iter().enumerate() {
+        for (rec_idx, rec) in sb.recs.iter().enumerate() {
+            let key = rec.key;
+            let mut i = (mix64(key) as usize) & tab.mask;
+            loop {
+                let v = tab.vals[i];
+                if v == EMPTY_LOC {
+                    tab.keys[i] = key;
+                    tab.vals[i] = ((buf_idx as u32) << 24) | rec_idx as u32;
+                    break;
                 }
-                let sb = &bufs[(s.rec_loc >> 32) as usize];
-                let srec = &sb.recs[(s.rec_loc & 0xFFFF_FFFF) as usize];
-                field_bytes(sb, &srec.id, srec.id_len) == ev_id
-            }) {
-                let s = &mut slots[slot_idx];
-                if rec.ingest_ms < s.min_ingest_ts {
-                    s.min_ingest_ts = rec.ingest_ms;
-                    s.valid_loc = if rec.user_len == INVALID_TAG {
-                        INVALID_LOC
+                if tab.keys[i] == key {
+                    let eb = &bufs[(v >> 24) as usize];
+                    let erec = &eb.recs[(v & 0xFF_FFFF) as usize];
+                    let same = if rec.id_loc == u32::MAX && erec.id_loc == u32::MAX {
+                        true
                     } else {
-                        rec_loc(buf_idx, rec_idx)
+                        key_bytes(rec.key, b'e', &sb.side, rec.id_loc, &mut tmp_a)
+                            == key_bytes(
+                                erec.key,
+                                b'e',
+                                &eb.side,
+                                erec.id_loc,
+                                &mut tmp_b,
+                            )
                     };
+                    if same {
+                        if rec.ingest_ms < erec.ingest_ms {
+                            tab.vals[i] = ((buf_idx as u32) << 24) | rec_idx as u32;
+                        }
+                        break;
+                    }
                 }
-            } else {
-                let idx = slots.len();
-                slots.push(ShardDedupSlot {
-                    ev_hash: rec.ev_hash,
-                    min_ingest_ts: rec.ingest_ms,
-                    id_len,
-                    rec_loc: rec_loc(buf_idx, rec_idx),
-                    valid_loc: if rec.user_len == INVALID_TAG {
-                        INVALID_LOC
-                    } else {
-                        rec_loc(buf_idx, rec_idx)
-                    },
-                });
-                table.insert_unique(rec.ev_hash, idx, |&i| slots[i].ev_hash);
+                i = (i + 1) & tab.mask;
             }
         }
     }
 
-    for s in slots.iter() {
-        if s.valid_loc != INVALID_LOC {
-            let buf = &bufs[(s.valid_loc >> 32) as usize];
-            let rec = &buf.recs[(s.valid_loc & 0xFFFF_FFFF) as usize];
-            let person = dsu.resolve(field_bytes(buf, &rec.user, rec.user_len));
-            let person_hash = hash64_bytes(person);
-            let part = (person_hash >> 56) as usize;
-            parts[part].push(Survivor {
-                person: SmallBytes::from_slice(person),
-                person_hash,
-                ev: rec.ev,
-            });
+    for &v in tab.vals.iter() {
+        if v == EMPTY_LOC {
+            continue;
         }
+        let sb = &bufs[(v >> 24) as usize];
+        let rec = &sb.recs[(v & 0xFF_FFFF) as usize];
+        if rec.flags & FLAG_INVALID != 0 {
+            continue;
+        }
+        let user = key_bytes(rec.user_key, b'u', &sb.side, rec.user_loc, &mut tmp_a);
+        let person = dsu.resolve(user);
+        let person_hash = hash64_bytes(person);
+        let part = (person_hash >> 56) as usize;
+        parts[part].push(Survivor {
+            person: SmallBytes::from_slice(person),
+            person_hash,
+            ev: rec.ev,
+        });
     }
 }
 
@@ -578,24 +634,36 @@ pub fn run_pipeline(
                 let Some(ingest_ms) = parse_f1_fast(fields[3]) else {
                     return;
                 };
-                let ev_hash = hash64_bytes(event_id);
-                let sb = &mut shards[(ev_hash >> 56) as usize];
-                let mut rec = EvRecord {
-                    ev_hash,
-                    ingest_ms,
-                    id_len: 0,
-                    user_len: INVALID_TAG,
-                    _pad: [0; 6],
-                    id: [0; 16],
-                    user: [0; 16],
-                    ev: 0,
+                let (key, slow_id) = field_key(event_id, b'e');
+                let sb = &mut shards[(mix64(key) >> 56) as usize];
+                let id_loc = if slow_id {
+                    sb.put_side(event_id)
+                } else {
+                    u32::MAX
                 };
-                sb.put_field(event_id, &mut rec.id, &mut rec.id_len);
-                if let Some((user, ev)) = validate_event_copy(fields, ingest_ms, catalog_ref) {
-                    sb.put_field(user, &mut rec.user, &mut rec.user_len);
-                    rec.ev = ev;
-                }
-                sb.recs.push(rec);
+                let (user_key, user_loc, ev, flags) =
+                    match validate_event_copy(fields, ingest_ms, catalog_ref) {
+                        Some((user, ev)) => {
+                            let (uk, slow_u) = field_key(user, b'u');
+                            let ul = if slow_u {
+                                sb.put_side(user)
+                            } else {
+                                u32::MAX
+                            };
+                            (uk, ul, ev, 0)
+                        }
+                        None => (0, u32::MAX, 0, FLAG_INVALID),
+                    };
+                sb.recs.push(EvRecord {
+                    key,
+                    ingest_ms,
+                    user_key,
+                    ev,
+                    id_loc,
+                    user_loc,
+                    flags,
+                    _pad: [0; 7],
+                });
             },
         )?;
         let mut flat: Vec<Vec<ShardBuf>> = (0..NUM_SHARDS).map(|_| Vec::new()).collect();
@@ -640,23 +708,36 @@ pub fn run_pipeline(
                 let Some(ingest_ms) = parse_f1_fast(fields[3]) else {
                     return;
                 };
-                let ev_hash = hash64_bytes(event_id);
-                let shard = (ev_hash >> 56) as usize;
-                let mut rec = EvRecord {
-                    ev_hash,
-                    ingest_ms,
-                    id_len: 0,
-                    user_len: INVALID_TAG,
-                    _pad: [0; 6],
-                    id: [0; 16],
-                    user: [0; 16],
-                    ev: 0,
+                let (key, slow_id) = field_key(event_id, b'e');
+                let shard = (mix64(key) >> 56) as usize;
+                let id_loc = if slow_id {
+                    tmp.put_side(event_id)
+                } else {
+                    u32::MAX
                 };
-                tmp.put_field(event_id, &mut rec.id, &mut rec.id_len);
-                if let Some((user, ev)) = validate_event_copy(fields, ingest_ms, catalog_ref) {
-                    tmp.put_field(user, &mut rec.user, &mut rec.user_len);
-                    rec.ev = ev;
-                }
+                let (user_key, user_loc, ev, flags) =
+                    match validate_event_copy(fields, ingest_ms, catalog_ref) {
+                        Some((user, ev)) => {
+                            let (uk, slow_u) = field_key(user, b'u');
+                            let ul = if slow_u {
+                                tmp.put_side(user)
+                            } else {
+                                u32::MAX
+                            };
+                            (uk, ul, ev, 0)
+                        }
+                        None => (0, u32::MAX, 0, FLAG_INVALID),
+                    };
+                let rec = EvRecord {
+                    key,
+                    ingest_ms,
+                    user_key,
+                    ev,
+                    id_loc,
+                    user_loc,
+                    flags,
+                    _pad: [0; 7],
+                };
                 let rec_bytes: &[u8] = unsafe {
                     std::slice::from_raw_parts(
                         &rec as *const EvRecord as *const u8,
@@ -685,11 +766,11 @@ pub fn run_pipeline(
                 } else {
                     let mut sb = ShardBuf::new();
                     let mut pos = 0usize;
-                    while pos + 68 <= b.len() {
+                    while pos + 52 <= b.len() {
                         let mut rec: EvRecord = unsafe {
                             std::ptr::read_unaligned(b[pos..].as_ptr() as *const EvRecord)
                         };
-                        pos += 64;
+                        pos += 48;
                         let side_len =
                             u32::from_le_bytes(b[pos..pos + 4].try_into().unwrap())
                                 as usize;
@@ -697,16 +778,11 @@ pub fn run_pipeline(
                         let base = sb.side.len() as u32;
                         sb.side.extend_from_slice(&b[pos..pos + side_len]);
                         pos += side_len;
-                        if rec.id_len == LONG_TAG {
-                            let off =
-                                u32::from_le_bytes(rec.id[..4].try_into().unwrap()) + base;
-                            rec.id[..4].copy_from_slice(&off.to_le_bytes());
+                        if rec.id_loc != u32::MAX {
+                            rec.id_loc += base;
                         }
-                        if rec.user_len == LONG_TAG {
-                            let off =
-                                u32::from_le_bytes(rec.user[..4].try_into().unwrap())
-                                    + base;
-                            rec.user[..4].copy_from_slice(&off.to_le_bytes());
+                        if rec.user_loc != u32::MAX {
+                            rec.user_loc += base;
                         }
                         sb.recs.push(rec);
                     }
@@ -740,12 +816,15 @@ pub fn run_pipeline(
                 if bufs.is_empty() {
                     return;
                 }
-                let est = bufs.iter().map(|b| b.recs.len()).sum::<usize>().max(64);
-                let mut table = HashTable::with_capacity(est * 2);
-                let mut slots: Vec<ShardDedupSlot> = Vec::with_capacity(est);
+                thread_local! {
+                    static DEDUP_TAB: std::cell::RefCell<DedupTab> =
+                        std::cell::RefCell::new(DedupTab::new());
+                }
                 let mut parts: Vec<Vec<Survivor>> =
                     (0..NUM_SHARDS).map(|_| Vec::new()).collect();
-                dedup_one_shard(bufs, dsu_ref, &mut table, &mut slots, &mut parts);
+                DEDUP_TAB.with(|t| {
+                    dedup_one_shard(bufs, dsu_ref, &mut t.borrow_mut(), &mut parts)
+                });
                 *surv_slots_ref[s].lock().unwrap() = Some(parts);
             });
             surv_slots
