@@ -1,6 +1,7 @@
 mod arena;
 mod catalog;
 mod csv_dialect;
+mod csv_scan;
 mod dsu;
 mod keys;
 mod parquet_out;

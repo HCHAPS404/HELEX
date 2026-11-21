@@ -22,11 +22,13 @@ use std::time::Instant;
 
 use crate::arena::{Arena, Blk, Scatter};
 use crate::catalog::Catalog;
-use crate::csv_dialect::{parse_price_cents, split_fields_csv};
+use crate::csv_dialect::parse_price_cents;
+use crate::csv_scan::{for_each_record, Masks};
 use crate::dsu::{csv_paths, load_links, Dsu};
 use crate::keys::{fast_key_bytes, id_key, id_key_padded, is_slow, mix64, shard_of, KeyMap};
 use crate::parquet_out::{
-    write_campaign_daily, write_user_daily_part, CampaignDailyRow, UserDailyRow,
+    write_campaign_daily, write_user_daily_part, CampaignDailyRow, UserDailyRow, UserDailyWriter,
+    BATCH_ROWS,
 };
 use crate::sso::SmallBytes;
 use crate::timestamp::parse_ts_padded;
@@ -171,6 +173,7 @@ enum Kind {
 
 struct InFile {
     file: File,
+    map: Option<memmap2::Mmap>,
     len: u64,
     data_start: u64,
     kind: Kind,
@@ -209,8 +212,14 @@ fn open_inputs(paths: &[PathBuf], kind: Kind, out: &mut Vec<InFile>) -> io::Resu
         if data_start >= len {
             continue;
         }
+        let map = if use_mmap() {
+            unsafe { memmap2::Mmap::map(&file) }.ok()
+        } else {
+            None
+        };
         out.push(InFile {
             file,
+            map,
             len,
             data_start,
             kind,
@@ -226,7 +235,7 @@ fn run_chunk(
     start: u64,
     end: u64,
     buf: &mut Vec<u8>,
-    mut line_fn: impl FnMut(&[u8]),
+    body: impl FnOnce(&[u8], bool, usize),
 ) -> io::Result<()> {
     let from = if start == f.data_start {
         start
@@ -234,6 +243,25 @@ fn run_chunk(
         start - 1
     };
     let limit = (end - from) as usize;
+    if let Some(map) = &f.map {
+        // Zero-copy path: populate the chunk's page-table entries in one
+        // call, then parse in place. Used only when the bytes after the last
+        // line still lie inside the file (wide loads read past field ends).
+        let m = &map[..];
+        let stop = match memchr::memchr(b'\n', &m[from as usize + limit - 1..]) {
+            Some(r) => from as usize + limit + r,
+            None => m.len(),
+        };
+        if stop + PAD <= m.len() {
+            let _ = map.advise_range(
+                memmap2::Advice::PopulateRead,
+                from as usize,
+                stop - from as usize,
+            );
+            body(&m[from as usize..stop], start == f.data_start, limit);
+            return Ok(());
+        }
+    }
     let mut want = ((end - from) + TAIL).min(f.len - from) as usize;
     loop {
         // +PAD: parsers do wide unaligned loads past field ends.
@@ -247,8 +275,22 @@ fn run_chunk(
         }
         want = (want * 2).min((f.len - from) as usize);
     }
-    let b = &buf[..want];
-    let mut pos = if start == f.data_start {
+    body(&buf[..want], start == f.data_start, limit);
+    Ok(())
+}
+
+fn use_mmap() -> bool {
+    !std::env::var("HELEX_IO").is_ok_and(|v| v == "pread")
+}
+
+#[cfg(test)]
+fn process_lines(
+    b: &[u8],
+    first: bool,
+    limit: usize,
+    mut line_fn: impl FnMut(&[u8]),
+) -> io::Result<()> {
+    let mut pos = if first {
         0
     } else if b[0] == b'\n' {
         1
@@ -329,6 +371,7 @@ struct P1 {
     slow_u: Vec<(u64, Box<[u8]>)>,
     long_cids: Vec<Box<[u8]>>,
     buf: Vec<u8>,
+    masks: Masks,
     err: Option<io::Error>,
 }
 
@@ -366,6 +409,10 @@ struct P3 {
     ck_cnt: Vec<u32>,
     cks: Vec<CkRec>,
     rows: Vec<UserDailyRow>,
+    worker: usize,
+    writer: Option<UserDailyWriter>,
+    rows_written: usize,
+    err: Option<io::Error>,
     grid: Vec<CampDayAgg>,
     camp_counts: Vec<u32>,
     in_active: Vec<bool>,
@@ -707,13 +754,32 @@ fn process_partition(st: &mut P3, ctx: &Ctx, pblocks: &[&[Blk<PRec>]], cblocks: 
     st.cks = cks;
 }
 
+fn flush_rows(st: &mut P3, dir: &Path, cats: &[Vec<u8>]) {
+    if st.rows.is_empty() || st.err.is_some() {
+        return;
+    }
+    if st.writer.is_none() {
+        match UserDailyWriter::create(&dir.join(format!("part-{}.parquet", st.worker)), cats) {
+            Ok(w) => st.writer = Some(w),
+            Err(e) => {
+                st.err = Some(e);
+                return;
+            }
+        }
+    }
+    let w = st.writer.as_mut().unwrap();
+    if let Err(e) = w.write_batch(&st.rows) {
+        st.err = Some(e);
+        return;
+    }
+    st.rows_written += st.rows.len();
+    st.rows.clear();
+}
+
 // ------------------------------------------------------------- line parsers
 
 #[inline(always)]
-fn parse_event_line(st: &mut P1, line: &[u8], pc: &PCtx, arena: &Arena) {
-    let Some(fields) = split_fields_csv::<7>(line) else {
-        return;
-    };
+fn parse_event_line(st: &mut P1, fields: &[&[u8]; 7], pc: &PCtx, arena: &Arena) {
     let event_id = fields[0];
     if event_id.is_empty() {
         return;
@@ -725,7 +791,7 @@ fn parse_event_line(st: &mut P1, line: &[u8], pc: &PCtx, arena: &Arena) {
     if slow_id {
         st.slow_e.push((key, event_id.into()));
     }
-    let (user, ev) = match validate_event_copy(&fields, ingest, pc) {
+    let (user, ev) = match validate_event_copy(fields, ingest, pc) {
         Some(ev) => {
             let (uk, slow_u) = unsafe { id_key_padded(fields[1], b'u') };
             if slow_u {
@@ -750,16 +816,14 @@ fn parse_event_line(st: &mut P1, line: &[u8], pc: &PCtx, arena: &Arena) {
 #[inline(always)]
 fn parse_click_line(
     st: &mut P1,
-    line: &[u8],
+    fields: &[&[u8]; 4],
     catalog: &Catalog,
     dsu: &Dsu,
     arena: &Arena,
     click_min_ts: i64,
     window_end: i64,
 ) {
-    let Some(fields) = split_fields_csv::<4>(line) else {
-        return;
-    };
+    
     let click_id = fields[0];
     let user_raw = fields[1];
     if click_id.is_empty() || user_raw.is_empty() {
@@ -908,6 +972,7 @@ pub fn run_pipeline(
                 slow_u: Vec::new(),
                 long_cids: Vec::new(),
                 buf: Vec::with_capacity((CHUNK + TAIL + 2) as usize),
+                masks: Masks::default(),
                 err: None,
             },
             |st, ti| {
@@ -917,9 +982,12 @@ pub fn run_pipeline(
                 let task = &tasks_ref[ti];
                 let f = &files_ref[task.file];
                 let mut buf = std::mem::take(&mut st.buf);
+                let mut masks = std::mem::take(&mut st.masks);
                 let res = match f.kind {
-                    Kind::Events => run_chunk(f, task.start, task.end, &mut buf, |line| {
-                        parse_event_line(st, line, pctx_ref, arena_ref)
+                    Kind::Events => run_chunk(f, task.start, task.end, &mut buf, |b, first, limit| {
+                        for_each_record::<7>(b, first, limit, &mut masks, |fields| {
+                            parse_event_line(st, fields, pctx_ref, arena_ref)
+                        })
                     }),
                     Kind::Clicks => {
                         let dsu = loop {
@@ -929,22 +997,25 @@ pub fn run_pipeline(
                             std::thread::yield_now();
                         };
                         match dsu {
-                            Ok(dsu) => run_chunk(f, task.start, task.end, &mut buf, |line| {
-                                parse_click_line(
-                                    st,
-                                    line,
-                                    catalog_ref,
-                                    dsu,
-                                    arena_ref,
-                                    click_min_ts,
-                                    we,
-                                )
+                            Ok(dsu) => run_chunk(f, task.start, task.end, &mut buf, |b, first, limit| {
+                                for_each_record::<4>(b, first, limit, &mut masks, |fields| {
+                                    parse_click_line(
+                                        st,
+                                        fields,
+                                        catalog_ref,
+                                        dsu,
+                                        arena_ref,
+                                        click_min_ts,
+                                        we,
+                                    )
+                                })
                             }),
                             Err(_) => Ok(()),
                         }
                     }
                 };
                 st.buf = buf;
+                st.masks = masks;
                 if let Err(e) = res {
                     st.err = Some(e);
                 }
@@ -1069,13 +1140,27 @@ pub fn run_pipeline(
                     }
                 }
             }
-            for j in 0..cap {
-                if keys[j] != 0 {
-                    let r = unsafe { &*(ptrs[j] as *const EvRec) };
-                    if r.user != 0 {
-                        let canon = dsu_r.resolve(r.user);
-                        st.out
-                            .push(arena_ref, shard_of(canon, P_BITS), PRec { canon, ev: r.ev });
+            // Winner emit: sequential re-scan of the records (the table is
+            // cache-resident), instead of random record reads from the table.
+            for w in evb.iter() {
+                for b in w[s].iter() {
+                    for r in b.as_slice() {
+                        if r.user == 0 {
+                            continue;
+                        }
+                        let k = r.key;
+                        let mut j = (mix64(k) as usize) & mask;
+                        while unsafe { *keys.get_unchecked(j) } != k {
+                            j = (j + 1) & mask;
+                        }
+                        if unsafe { *ptrs.get_unchecked(j) } == r as *const EvRec as usize {
+                            let canon = dsu_r.resolve(r.user);
+                            st.out.push(
+                                arena_ref,
+                                shard_of(canon, P_BITS),
+                                PRec { canon, ev: r.ev },
+                            );
+                        }
                     }
                 }
             }
@@ -1108,10 +1193,14 @@ pub fn run_pipeline(
     let ctx_r = &ctx;
     let pb = &p_blocks;
     let cb = &ck_blocks;
+    let user_dir = out_dir.join("user_daily");
+    fs::create_dir_all(&user_dir)?;
+    let ud = &user_dir;
+    let cats = &catalog.categories;
     let p3_states = par_tasks(
         NP,
         threads,
-        |_| P3 {
+        |w| P3 {
             pmap: KeyMap::with_capacity(1024),
             lids: Vec::new(),
             counts: Vec::new(),
@@ -1120,7 +1209,11 @@ pub fn run_pipeline(
             ck_lid: Vec::new(),
             ck_cnt: Vec::new(),
             cks: Vec::new(),
-            rows: Vec::new(),
+            rows: Vec::with_capacity(BATCH_ROWS + 4096),
+            worker: w,
+            writer: None,
+            rows_written: 0,
+            err: None,
             grid: vec![CampDayAgg::default(); num_camps * num_days],
             camp_counts: vec![0; num_camps],
             in_active: vec![false; num_camps],
@@ -1131,52 +1224,54 @@ pub fn run_pipeline(
             let pbl: Vec<&[Blk<PRec>]> = pb.iter().map(|t| t[p].as_slice()).collect();
             let cbl: Vec<&[Blk<CkRec>]> = cb.iter().map(|t| t[p].as_slice()).collect();
             process_partition(st, ctx_r, &pbl, &cbl);
+            if st.rows.len() >= BATCH_ROWS {
+                flush_rows(st, ud, cats);
+            }
         },
     );
     let t_sess = t3.elapsed();
 
-    // ---- phase 4: output
+    // ---- phase 4: output (remaining user rows + campaign table)
     let t4 = Instant::now();
-    let user_dir = out_dir.join("user_daily");
-    fs::create_dir_all(&user_dir)?;
     let mut grid = vec![CampDayAgg::default(); num_camps * num_days];
-    let mut row_sets: Vec<Vec<UserDailyRow>> = Vec::with_capacity(p3_states.len());
-    for st in p3_states {
+    for st in &p3_states {
         for (g, a) in grid.iter_mut().zip(st.grid.iter()) {
             g.sessions += a.sessions;
             g.purchasing_sessions += a.purchasing_sessions;
             g.revenue_cents += a.revenue_cents;
             g.assisted_sessions += a.assisted_sessions;
         }
-        row_sets.push(st.rows);
     }
-    let total_user_rows: usize = row_sets.iter().map(|r| r.len()).sum();
-    let non_empty: Vec<usize> = (0..row_sets.len())
-        .filter(|&i| !row_sets[i].is_empty())
-        .collect();
-    let write_err: Mutex<Option<io::Error>> = Mutex::new(None);
-    if non_empty.is_empty() {
+    let p3_states: Vec<P3> = std::thread::scope(|sc| {
+        let hs: Vec<_> = p3_states
+            .into_iter()
+            .map(|mut st| {
+                sc.spawn(move || {
+                    flush_rows(&mut st, ud, cats);
+                    if let Some(w) = st.writer.take() {
+                        if let Err(e) = w.close() {
+                            st.err.get_or_insert(e);
+                        }
+                    }
+                    st
+                })
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let mut total_user_rows = 0usize;
+    let mut any_file = false;
+    for st in &p3_states {
+        total_user_rows += st.rows_written;
+        any_file |= st.rows_written > 0;
+    }
+    for st in p3_states {
+        if let Some(e) = st.err {
+            return Err(e);
+        }
+    }
+    if !any_file {
         write_user_daily_part(&user_dir.join("part-0.parquet"), &[], &catalog.categories)?;
-    } else {
-        let rs = &row_sets;
-        let ne = &non_empty;
-        let ud = &user_dir;
-        let cats = &catalog.categories;
-        let we_ref = &write_err;
-        par_tasks(
-            ne.len(),
-            threads,
-            |_| (),
-            |_, k| {
-                let path = ud.join(format!("part-{k}.parquet"));
-                if let Err(e) = write_user_daily_part(&path, &[rs[ne[k]].as_slice()], cats) {
-                    *we_ref.lock().unwrap() = Some(e);
-                }
-            },
-        );
-    }
-    if let Some(e) = write_err.into_inner().unwrap() {
-        return Err(e);
     }
     let mut camp_rows: Vec<CampaignDailyRow> = Vec::new();
     for (cell, agg) in grid.iter().enumerate() {
@@ -1209,7 +1304,6 @@ pub fn run_pipeline(
         total_user_rows,
         camp_rows.len()
     );
-    std::mem::forget(row_sets);
     std::mem::forget(ev_blocks);
     std::mem::forget(ck_blocks);
     std::mem::forget(p_blocks);
@@ -1270,7 +1364,8 @@ mod tests {
         let out = dir.join("out");
         let scratch = dir.join("scratch");
         run_pipeline(&data, &out, &scratch, false).unwrap();
-        assert!(out.join("user_daily/part-0.parquet").is_file());
+        let parts = fs::read_dir(out.join("user_daily")).unwrap().count();
+        assert!(parts >= 1);
         assert!(out.join("campaign_daily/part-0.parquet").is_file());
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1301,7 +1396,10 @@ mod tests {
             let mut s = f.data_start;
             while s < f.len {
                 let e = (s + chunk).min(f.len);
-                run_chunk(f, s, e, &mut buf, |l| got.push(l.to_vec())).unwrap();
+                run_chunk(f, s, e, &mut buf, |b, first, limit| {
+                    process_lines(b, first, limit, |l| got.push(l.to_vec())).unwrap()
+                })
+                .unwrap();
                 s = e;
             }
             assert_eq!(got, expected, "chunk={chunk}");
