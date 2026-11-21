@@ -15,6 +15,9 @@ class ARGS:
     seed = int(os.environ.get("SEED", "3"))
     events = int(os.environ.get("EVENTS", "20000000"))
     clicks = int(os.environ.get("CLICKS", "5000000"))
+    # Optional merged .profdata file: builds the bench binary with
+    # -Cprofile-use for PGO A/B measurements.
+    pgo_profdata = os.environ.get("PGO_PROFDATA", "")
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -27,18 +30,29 @@ _base = (
 )
 
 if ARGS.generator_dir:
-    image = (
+    _img = (
         _base
         .add_local_dir(os.path.join(REPO, "src"), "/build/src", copy=True)
         .add_local_file(os.path.join(REPO, "Cargo.toml"), "/build/Cargo.toml", copy=True)
         .add_local_file(os.path.join(REPO, "Cargo.lock"), "/build/Cargo.lock", copy=True)
         .add_local_dir(ARGS.generator_dir, "/gen", copy=True)
-        .run_commands(
+    )
+    if ARGS.pgo_profdata:
+        _img = _img.add_local_file(
+            ARGS.pgo_profdata, "/pgo/merged.profdata", copy=True
+        ).run_commands(
+            'cd /build && RUSTFLAGS="-C target-cpu=x86-64-v2 '
+            '-Cprofile-use=/pgo/merged.profdata" cargo build --release',
+            "cp /build/target/release/shopping-sessions /usr/local/bin/",
+            "cd /gen && cargo build --release && cp target/release/generate /usr/local/bin/",
+        )
+    else:
+        _img = _img.run_commands(
             'cd /build && RUSTFLAGS="-C target-cpu=x86-64-v2" cargo build --release',
             "cp /build/target/release/shopping-sessions /usr/local/bin/",
             "cd /gen && cargo build --release && cp target/release/generate /usr/local/bin/",
         )
-    )
+    image = _img
 else:
     image = _base
 
