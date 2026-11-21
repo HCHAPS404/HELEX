@@ -151,8 +151,8 @@ pub fn load_links(data_dir: &Path, threads: usize) -> io::Result<UnionFind> {
         threads,
         |_| Vec::<(SmallBytes, u64, SmallBytes, u64)>::with_capacity(est_ids / threads.max(1) + 64),
         |pairs, line, ascii| {
-            let fields = if ascii && memchr::memchr(b'"', line).is_none() {
-                crate::csv_dialect::split_fields_unquoted::<2>(line)
+            let fields = if ascii {
+                crate::csv_dialect::split_fields_csv::<2>(line)
             } else {
                 parse_fixed_fields::<2>(line)
             };

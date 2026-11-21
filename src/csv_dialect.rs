@@ -73,6 +73,40 @@ pub fn split_fields_unquoted<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> 
     Some(out)
 }
 
+/// Unified scanner for ASCII-verified chunks: values never contain commas, so
+/// fields split on `,`; every `"` must sit exactly at a field boundary, which
+/// we verify by scanning quote *positions* once (usually 0-4 per line) instead
+/// of re-scanning every field. Strips whole-field quotes; rejects misplaced or
+/// unbalanced quotes exactly like the strict dialect path.
+#[inline]
+pub fn split_fields_csv<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
+    let mut out = split_fields_unquoted::<N>(line)?;
+    if memchr::memchr(b'"', line).is_none() {
+        return Some(out);
+    }
+    let mut q = 0usize;
+    while let Some(rel) = memchr::memchr(b'"', &line[q..]) {
+        let p = q + rel;
+        let open = p == 0 || line[p - 1] == b',';
+        let close = p + 1 == line.len() || line[p + 1] == b',';
+        if !open && !close {
+            return None;
+        }
+        q = p + 1;
+    }
+    for f in out.iter_mut() {
+        let lead = f.first() == Some(&b'"');
+        let tail = f.last() == Some(&b'"');
+        if lead != tail || (lead && f.len() < 2) {
+            return None;
+        }
+        if lead {
+            *f = &f[1..f.len() - 1];
+        }
+    }
+    Some(out)
+}
+
 #[inline]
 pub fn parse_price_cents(raw: &[u8]) -> Option<u32> {
     if raw.is_empty() {
