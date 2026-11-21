@@ -7,7 +7,7 @@ use std::sync::Mutex;
 
 use crate::catalog::Catalog;
 use crate::csv_dialect::{parse_price_cents, split_fields_csv};
-use crate::dsu::csv_paths;
+use crate::dsu::{csv_paths, UnionFind};
 use crate::io_pool::{parallel_for, process_csv_files_parallel, worker_count};
 use crate::mem_guard::should_spill_events;
 use crate::parquet_out::{
@@ -56,31 +56,18 @@ fn ev_purch(ev: u64) -> bool {
 // (1=lines only, 2=+field split, 3=+keys/ingest ts, 4=+validate, 5=full).
 static PARSE_LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
 
-// 16B survivor record: dense person index (canon_shard<<24 | local) + packed event.
+// 16B survivor record: canonical-person key + packed event. Person identity
+// IS the canonical user key (field_key of the DSU canonical id; non-encodable
+// ids use hash64) — no dense person table or map phase needed.
 #[derive(Clone, Copy)]
-struct Rec12 {
+struct Rec16 {
+    canon_key: u64,
     ev: u64,
-    person_idx: u32,
-    _pad: u32,
 }
 
-// Click candidate partitioned by user shard; resolved to person_idx after the
-// user->person map is built.
-struct ClickCand {
-    user: SmallBytes,
-    ts: i64,
-    click_id: SmallBytes,
-    camp_id: u16,
-}
-
-struct ResClick {
-    person_idx: u32,
-    ts: i64,
-    click_id: SmallBytes,
-    camp_id: u16,
-}
-
-struct ClickItem {
+// Click resolved to canon_key at parse time and partitioned by canon shard.
+struct ClickRec {
+    canon_key: u64,
     ts: i64,
     click_id: SmallBytes,
     camp_id: u16,
@@ -294,14 +281,12 @@ fn pack_loc(invalid: bool, buf_idx: usize, rec_idx: usize) -> u32 {
 }
 
 // Phase A: insert all records, then mark winner bits. Returns one u64 bitset
-// per buf (bit r = record r is a valid winner). Sequential emit/collect passes
+// per buf (bit r = record r is a valid winner). Sequential emit passes
 // replace random record lookups.
 fn dedup_insert_mark(
     bufs: &[ShardBuf],
     tab: &mut DedupTab,
     ins_nanos: &std::sync::atomic::AtomicU64,
-    u_stg: &mut Vec<Vec<u64>>,
-    uslow: &mut Vec<(u64, SmallBytes)>,
 ) -> Vec<Vec<u64>> {
     let est: usize = bufs.iter().map(|b| b.recs.len()).sum();
     tab.reset(est);
@@ -328,15 +313,6 @@ fn dedup_insert_mark(
             }
             let key = rec.key;
             let inv = rec.flags & FLAG_INVALID != 0;
-            // Fused user collection (superset of winners): avoids a second
-            // sequential 48B/record sweep just to read user_key.
-            let uk = rec.user_key;
-            if rec.user_loc == u32::MAX && uk != 0 {
-                u_stg[(uk >> 56) as usize].push(uk);
-            } else {
-                let bytes = key_bytes(uk, b'u', &sb.side, rec.user_loc, &mut tmp_a);
-                uslow.push((uk, SmallBytes::from_slice(bytes)));
-            }
             let mut i = (mix64(key) as usize) & tab.mask;
             loop {
                 let v = tab.vals[i];
@@ -392,22 +368,24 @@ fn dedup_insert_mark(
     win_bits
 }
 
-// Phase E: sequential scan over winner bits -> probe map -> 16B
-// (person_idx | ev) records into person partitions (part = person_idx >> 24).
+// Phase E: sequential scan over winner bits -> linkmap probe -> 16B
+// (canon_key | ev) records into canon partitions (part = canon_key >> 56).
+// A linkmap miss means the user is unlinked: canon_key = own user key.
 fn emit_shard(
     bufs: &[ShardBuf],
     win_bits: &[Vec<u64>],
-    umaps: &[UMap],
-    slow_umaps: &[Vec<SlowUser>],
-    parts: &mut Vec<Vec<Rec12>>,
+    link_maps: &[LinkMap],
+    dsu: &UnionFind,
+    side_emit: &[Mutex<Vec<(u64, SmallBytes)>>],
+    parts: &mut Vec<Vec<Rec16>>,
     emit_nanos: &std::sync::atomic::AtomicU64,
 ) {
     let t_emit = std::time::Instant::now();
     let mut tmp_a = [0u8; 9];
     // L1-dTLB staging: 4 records per partition (64B = 1 cache line), flushed
     // as whole blocks to avoid 256-way random single-record writes.
-    let mut stage: [[Rec12; 4]; NUM_SHARDS] =
-        [[Rec12 { ev: 0, person_idx: 0, _pad: 0 }; 4]; NUM_SHARDS];
+    let mut stage: [[Rec16; 4]; NUM_SHARDS] =
+        [[Rec16 { canon_key: 0, ev: 0 }; 4]; NUM_SHARDS];
     let mut stage_n: [u8; NUM_SHARDS] = [0; NUM_SHARDS];
     for (b, sb) in bufs.iter().enumerate() {
         for (w_idx, &word) in win_bits[b].iter().enumerate() {
@@ -417,24 +395,25 @@ fn emit_shard(
                 w &= w - 1;
                 let rec = &sb.recs[r];
                 let uk = rec.user_key;
-                let person_idx = if rec.user_loc == u32::MAX && uk != 0 {
-                    umaps[(uk >> 56) as usize].get(uk)
+                let ck = if rec.user_loc == u32::MAX && uk != 0 {
+                    link_maps[(uk >> 56) as usize].get(uk).unwrap_or(uk)
                 } else {
                     let bytes =
                         key_bytes(uk, b'u', &sb.side, rec.user_loc, &mut tmp_a);
-                    slow_umaps[(uk >> 56) as usize]
-                        .iter()
-                        .find(|s| s.key == uk && s.bytes.as_slice() == bytes)
-                        .map(|s| s.person_idx)
+                    let canon = dsu.resolve(bytes);
+                    let (ck, cslow) = field_key(canon, b'u');
+                    if cslow || ck == 0 {
+                        side_emit[(ck >> 56) as usize]
+                            .lock()
+                            .unwrap()
+                            .push((ck, SmallBytes::from_slice(canon)));
+                    }
+                    ck
                 };
-                let Some(person_idx) = person_idx else {
-                    continue;
-                };
-                let part = (person_idx >> 24) as usize;
-                stage[part][stage_n[part] as usize] = Rec12 {
+                let part = (ck >> 56) as usize;
+                stage[part][stage_n[part] as usize] = Rec16 {
+                    canon_key: ck,
                     ev: rec.ev,
-                    person_idx,
-                    _pad: 0,
                 };
                 let n = stage_n[part] + 1;
                 if n == 4 {
@@ -458,26 +437,27 @@ fn emit_shard(
     );
 }
 
-// Open-address u64 -> person_idx map per user shard. user_key==0 means empty
-// (fast-path user keys are always nonzero; slow users live in slow_umaps).
-struct UMap {
+// Open-address u64 -> canon_key map per user shard, built once from DSU
+// (raw -> canonical) pairs. key==0 means empty; a miss means the user is
+// unlinked and self-canonical (emit/clicks fall back to uk).
+struct LinkMap {
     keys: Vec<u64>,
-    vals: Vec<u32>,
+    vals: Vec<u64>,
     mask: usize,
 }
 
-impl UMap {
+impl LinkMap {
     fn with_capacity(cap: usize) -> Self {
         let c = (cap * 2).next_power_of_two().max(64);
         Self {
             keys: vec![0u64; c],
-            vals: vec![0u32; c],
+            vals: vec![0u64; c],
             mask: c - 1,
         }
     }
 
     #[inline]
-    fn insert(&mut self, key: u64, val: u32) {
+    fn insert(&mut self, key: u64, val: u64) {
         let mut i = (mix64(key) as usize) & self.mask;
         while self.keys[i] != 0 && self.keys[i] != key {
             i = (i + 1) & self.mask;
@@ -487,7 +467,7 @@ impl UMap {
     }
 
     #[inline]
-    fn get(&self, key: u64) -> Option<u32> {
+    fn get(&self, key: u64) -> Option<u64> {
         let mut i = (mix64(key) as usize) & self.mask;
         loop {
             let k = self.keys[i];
@@ -502,141 +482,167 @@ impl UMap {
     }
 }
 
-// Canonical-person registry for one canon shard. person_idx = (shard<<24)|local
-// where local indexes canon_bytes. kind 0 = key-encoded (u64 equality is exact),
-// kind 1 = side bytes (hash64 key + byte-compare).
-struct CanonShard {
-    keys: Vec<u64>,
-    kinds: Vec<u8>,
-    local: Vec<u32>,
-    canon_bytes: Vec<SmallBytes>,
-    mask: usize,
-}
-
-impl CanonShard {
-    fn new(cap: usize) -> Self {
-        let c = (cap * 2).next_power_of_two().max(64);
-        Self {
-            keys: vec![0u64; c],
-            kinds: vec![0u8; c],
-            local: vec![0u32; c],
-            canon_bytes: Vec::with_capacity(cap),
-            mask: c - 1,
-        }
+// Build per-user-shard user_key -> canon_key maps from the DSU's interned
+// (raw -> canonical) pairs, plus side bytes for non-encodable canonical ids
+// (needed for user_daily output). Self-canonical members are skipped: a map
+// miss already means "unlinked, canon = self". Runs inside the DSU window so
+// it costs nothing on the critical path.
+fn build_link_maps(
+    dsu: &crate::dsu::UnionFind,
+    threads: usize,
+) -> (Vec<LinkMap>, Vec<Vec<(u64, SmallBytes)>>) {
+    let pair_slots: Vec<Mutex<Vec<(u64, u64)>>> =
+        (0..NUM_SHARDS).map(|_| Mutex::new(Vec::new())).collect();
+    let side_slots: Vec<Mutex<Vec<(u64, SmallBytes)>>> =
+        (0..NUM_SHARDS).map(|_| Mutex::new(Vec::new())).collect();
+    {
+        let pr = &pair_slots;
+        let sr = &side_slots;
+        let workers = threads.max(1);
+        parallel_for(workers, threads, |w| {
+            let n = dsu.len();
+            let lo = n * w / workers;
+            let hi = n * (w + 1) / workers;
+            let mut lp: Vec<Vec<(u64, u64)>> =
+                (0..NUM_SHARDS).map(|_| Vec::new()).collect();
+            let mut ls: Vec<Vec<(u64, SmallBytes)>> =
+                (0..NUM_SHARDS).map(|_| Vec::new()).collect();
+            for i in lo..hi {
+                let (raw, canon) = dsu.pair_at(i);
+                if raw == canon {
+                    continue;
+                }
+                let (uk, uslow) = field_key(raw, b'u');
+                let (ck, cslow) = field_key(canon, b'u');
+                if cslow || ck == 0 {
+                    ls[(ck >> 56) as usize]
+                        .push((ck, SmallBytes::from_slice(canon)));
+                }
+                if !uslow && uk != 0 {
+                    lp[(uk >> 56) as usize].push((uk, ck));
+                }
+            }
+            for s in 0..NUM_SHARDS {
+                if !lp[s].is_empty() {
+                    pr[s].lock().unwrap().append(&mut lp[s]);
+                }
+                if !ls[s].is_empty() {
+                    sr[s].lock().unwrap().append(&mut ls[s]);
+                }
+            }
+        });
     }
-
-    #[inline]
-    fn intern(&mut self, canon_key: u64, canon: &[u8], slow: bool) -> u32 {
-        let mut i = (mix64(canon_key) as usize) & self.mask;
-        loop {
-            if self.keys[i] == 0 {
-                let idx = self.canon_bytes.len() as u32;
-                self.keys[i] = canon_key;
-                self.kinds[i] = slow as u8;
-                self.local[i] = idx;
-                self.canon_bytes.push(SmallBytes::from_slice(canon));
-                return idx;
+    let map_slots: Vec<Mutex<Option<LinkMap>>> =
+        (0..NUM_SHARDS).map(|_| Mutex::new(None)).collect();
+    {
+        let pr = &pair_slots;
+        let ms = &map_slots;
+        parallel_for(NUM_SHARDS, threads, |s| {
+            let entries = std::mem::take(&mut *pr[s].lock().unwrap());
+            let mut m = LinkMap::with_capacity(entries.len() + 8);
+            for (k, v) in entries {
+                m.insert(k, v);
             }
-            if self.keys[i] == canon_key
-                && (self.kinds[i] == 0
-                    || self.canon_bytes[self.local[i] as usize].as_slice() == canon)
-            {
-                return self.local[i];
-            }
-            i = (i + 1) & self.mask;
-        }
+            *ms[s].lock().unwrap() = Some(m);
+        });
     }
-
-    #[inline]
-    fn get(&self, canon_key: u64, canon: &[u8], slow: bool) -> Option<u32> {
-        let mut i = (mix64(canon_key) as usize) & self.mask;
-        loop {
-            if self.keys[i] == 0 {
-                return None;
-            }
-            if self.keys[i] == canon_key
-                && (!slow
-                    || (self.kinds[i] == 1
-                        && self.canon_bytes[self.local[i] as usize].as_slice()
-                            == canon))
-            {
-                return Some(self.local[i]);
-            }
-            i = (i + 1) & self.mask;
-        }
-    }
-}
-
-// Slow-path user entry: (hash64 key, raw user bytes, person_idx).
-struct SlowUser {
-    key: u64,
-    bytes: SmallBytes,
-    person_idx: u32,
-}
-
-// Pending canon fill: canon_bytes empty = key-encoded canon, user_bytes
-// empty = key-encoded user (goes to UMap, else to slow_umaps).
-struct PendSu {
-    canon_key: u64,
-    user_key: u64,
-    canon_bytes: SmallBytes,
-    user_bytes: SmallBytes,
+    let maps: Vec<LinkMap> = map_slots
+        .into_iter()
+        .map(|m| m.into_inner().unwrap().unwrap())
+        .collect();
+    let side: Vec<Vec<(u64, SmallBytes)>> = side_slots
+        .into_iter()
+        .map(|m| {
+            let mut v = m.into_inner().unwrap();
+            v.sort_unstable_by_key(|e| e.0);
+            v.dedup_by_key(|e| e.0);
+            v
+        })
+        .collect();
+    (maps, side)
 }
 
 fn process_partition(
-    surv_slices: &[&[Rec12]],
-    click_slices: &[&[ResClick]],
-    canon: &[SmallBytes],
+    surv_slices: &[&[Rec16]],
+    click_slices: &[&[ClickRec]],
+    canon_side: &[(u64, SmallBytes)],
     catalog: &Catalog,
     ws: i64,
     day0: i32,
     num_days: usize,
 ) -> (Vec<UserDailyRow>, Vec<(u32, CampDayAgg)>) {
-    let n = canon.len();
-    let mut ev_by_p: Vec<Vec<u64>> = (0..n).map(|_| Vec::new()).collect();
-    for slice in surv_slices {
-        for r in slice.iter() {
-            ev_by_p[(r.person_idx & 0xFF_FFFF) as usize].push(r.ev);
-        }
+    let n_ev: usize = surv_slices.iter().map(|s| s.len()).sum();
+    let mut recs: Vec<Rec16> = Vec::with_capacity(n_ev);
+    for s in surv_slices {
+        recs.extend_from_slice(s);
     }
-    let mut ck_by_p: Vec<Vec<ClickItem>> = (0..n).map(|_| Vec::new()).collect();
-    for slice in click_slices {
-        for c in slice.iter() {
-            ck_by_p[(c.person_idx & 0xFF_FFFF) as usize].push(ClickItem {
+    // Sorting by (canon_key, ev) groups each person's events already ordered
+    // by (ts, event key) — the old dense ev_by_p scatter is no longer needed.
+    recs.sort_unstable_by(|a, b| (a.canon_key, a.ev).cmp(&(b.canon_key, b.ev)));
+
+    let n_ck: usize = click_slices.iter().map(|s| s.len()).sum();
+    let mut clicks: Vec<ClickRec> = Vec::with_capacity(n_ck);
+    for s in click_slices {
+        for c in s.iter() {
+            clicks.push(ClickRec {
+                canon_key: c.canon_key,
                 ts: c.ts,
                 click_id: c.click_id.clone(),
                 camp_id: c.camp_id,
             });
         }
     }
+    clicks.sort_unstable_by(|a, b| {
+        a.canon_key
+            .cmp(&b.canon_key)
+            .then_with(|| a.ts.cmp(&b.ts))
+            .then_with(|| Reverse(&a.click_id).cmp(&Reverse(&b.click_id)))
+    });
+    clicks.dedup_by(|a, b| {
+        a.canon_key == b.canon_key && a.ts == b.ts && a.click_id == b.click_id
+    });
 
     let num_cats = catalog.categories.len();
     let num_camps_with_org = catalog.campaign_ids.len();
     let mut camp_grid = vec![CampDayAgg::default(); num_camps_with_org * num_days];
-    let mut user_rows: Vec<UserDailyRow> = Vec::with_capacity(n * 2);
+    let mut user_rows: Vec<UserDailyRow> = Vec::with_capacity(recs.len() / 8 + 8);
     let mut camp_counts = vec![0u32; num_camps_with_org];
     let mut in_active = vec![false; num_camps_with_org];
     let mut active_camps: Vec<u16> = Vec::with_capacity(64);
     let mut day_cat_rev = vec![0u64; num_cats];
+    let mut tmp_key = [0u8; 9];
 
-    for ((i, mut evs), mut clicks) in ev_by_p
-        .into_iter()
-        .enumerate()
-        .zip(ck_by_p.into_iter())
-    {
-        let person = canon[i].clone();
-        if evs.is_empty() {
-            continue;
+    // Grouped iteration: recs sorted by (canon_key, ev) gives each person's
+    // events pre-ordered; a parallel cursor walks the sorted click list.
+    let mut ci = 0usize;
+    let mut gi = 0usize;
+    while gi < recs.len() {
+        let ck = recs[gi].canon_key;
+        let g0 = gi;
+        while gi < recs.len() && recs[gi].canon_key == ck {
+            gi += 1;
         }
-        evs.sort_unstable();
+        let evs = &recs[g0..gi];
 
-        if !clicks.is_empty() {
-            clicks.sort_unstable_by(|a, b| {
-                a.ts.cmp(&b.ts)
-                    .then_with(|| Reverse(&a.click_id).cmp(&Reverse(&b.click_id)))
-            });
-            clicks.dedup_by(|a, b| a.ts == b.ts && a.click_id == b.click_id);
+        while ci < clicks.len() && clicks[ci].canon_key < ck {
+            ci += 1;
         }
+        let c0 = ci;
+        while ci < clicks.len() && clicks[ci].canon_key == ck {
+            ci += 1;
+        }
+        let clicks = &clicks[c0..ci];
+
+        let person = match canon_side.binary_search_by_key(&ck, |e| e.0) {
+            Ok(j) => canon_side[j].1.clone(),
+            Err(_) => SmallBytes::from_slice(key_bytes(
+                ck,
+                b'u',
+                &[],
+                u32::MAX,
+                &mut tmp_key,
+            )),
+        };
 
         let mut left = 0usize;
         let mut right = 0usize;
@@ -648,7 +654,7 @@ fn process_partition(
 
         let mut idx = 0usize;
         while idx < evs.len() {
-            let sess_start = ev_ts(ws, evs[idx]);
+            let sess_start = ev_ts(ws, evs[idx].ev);
             let mut prev_ts = sess_start;
             let mut sess_events: i64 = 0;
             let mut sess_rev: i64 = 0;
@@ -685,7 +691,7 @@ fn process_partition(
             cur_day = sess_day;
 
             while idx < evs.len() {
-                let e = evs[idx];
+                let e = evs[idx].ev;
                 let ts = ev_ts(ws, e);
                 if ts - prev_ts > SESSION_GAP_MS {
                     break;
@@ -836,12 +842,19 @@ pub fn run_pipeline(
 
     // DSU build (links ingest + union) overlaps the events shard ingest:
     // canonicalization is only needed at dedup emission, not during parse.
-    let (dsu, shard_inputs, t_ingest, t_dsu_wall) = std::thread::scope(|scope| -> io::Result<_> {
+    let (dsu, link_maps, canon_side_base, shard_inputs, t_ingest, t_dsu_wall) =
+        std::thread::scope(|scope| -> io::Result<_> {
         let dsu_handle = scope.spawn(|| {
             let tt = std::time::Instant::now();
             // Links are tiny (~1MB per 1M events): 2 workers suffice; more
             // just oversubscribes CPUs shared with the event parse pool.
-            (crate::dsu::load_links(data_dir, threads.min(2)), tt)
+            let r = crate::dsu::load_links(data_dir, threads.min(2)).map(|uf| {
+                // Person identity = canon_key: prebuild user->canon maps while
+                // the event ingest still owns the machine.
+                let (lm, side) = build_link_maps(&uf, threads);
+                (uf, lm, side)
+            });
+            (r, tt)
         });
         let inputs: Vec<Vec<ShardBuf>> = if !spill {
         let block_sz = if total_event_bytes >= (64 << 20) {
@@ -1078,7 +1091,8 @@ pub fn run_pipeline(
         };
         let t_ingest = t1.elapsed();
         let (dsu_res, t_dsu_start) = dsu_handle.join().unwrap();
-        Ok((dsu_res?, inputs, t_ingest, t_dsu_start.elapsed()))
+        let (uf, lm, side) = dsu_res?;
+        Ok((uf, lm, side, inputs, t_ingest, t_dsu_start.elapsed()))
     })?;
     let dsu_ref = &dsu;
     let t2 = t1;
@@ -1089,25 +1103,22 @@ pub fn run_pipeline(
     // Dedup (CPU/RAM-bound) and click CSV ingest (I/O+parse-bound) overlap:
     // dedup runs on a scoped worker while clicks stream through the pool.
     let shard_inputs_ref = &shard_inputs;
+    let link_maps_ref = &link_maps;
     let ins_ref = &ins_nanos;
     let emit_ref = &emit_nanos;
-    let mut click_parts_res: Option<io::Result<Vec<Vec<Vec<ClickCand>>>>> = None;
+    let mut click_parts_res: Option<io::Result<Vec<Vec<Vec<ClickRec>>>>> = None;
     let click_min_ts = catalog.window_start - CLICK_REACH_MS;
     type DedupOut = (
-        Vec<Vec<Vec<Rec12>>>,
-        Vec<CanonShard>,
-        Vec<UMap>,
-        Vec<Vec<SlowUser>>,
-        std::time::Duration,
+        Vec<Vec<Vec<Rec16>>>,
+        Vec<Vec<(u64, SmallBytes)>>,
         std::time::Duration,
     );
-    let (survivors, canon_shards, umaps, slow_umaps, t_dedup_wall, t_map_wall): DedupOut =
+    let (survivors, side_emit_v, t_dedup_wall): DedupOut =
         std::thread::scope(|scope| {
         let dedup_handle = scope.spawn(|| {
             let td = std::time::Instant::now();
-            // Phase A: per-shard dedup insert + winner bits + user collect.
-            type AOut = (Vec<Vec<u64>>, Vec<Vec<u64>>, Vec<(u64, SmallBytes)>);
-            let a_slots: Vec<Mutex<Option<AOut>>> = (0..NUM_SHARDS)
+            // Phase A: per-shard dedup insert + winner bits.
+            let a_slots: Vec<Mutex<Option<Vec<Vec<u64>>>>> = (0..NUM_SHARDS)
                 .map(|_| Mutex::new(None))
                 .collect();
             {
@@ -1121,269 +1132,61 @@ pub fn run_pipeline(
                         static DEDUP_TAB: std::cell::RefCell<DedupTab> =
                             std::cell::RefCell::new(DedupTab::new());
                     }
-                    let mut u_stg: Vec<Vec<u64>> =
-                        (0..NUM_SHARDS).map(|_| Vec::new()).collect();
-                    let mut uslow: Vec<(u64, SmallBytes)> = Vec::new();
                     let bits = DEDUP_TAB.with(|t| {
-                        dedup_insert_mark(
-                            bufs,
-                            &mut t.borrow_mut(),
-                            ins_ref,
-                            &mut u_stg,
-                            &mut uslow,
-                        )
+                        dedup_insert_mark(bufs, &mut t.borrow_mut(), ins_ref)
                     });
-                    *a_ref[s].lock().unwrap() = Some((bits, u_stg, uslow));
+                    *a_ref[s].lock().unwrap() = Some(bits);
                 });
             }
-            let t_a = td.elapsed();
 
             let mut win_bits: Vec<Vec<Vec<u64>>> = Vec::with_capacity(NUM_SHARDS);
-            let mut u_lists: Vec<Vec<u64>> =
-                (0..NUM_SHARDS).map(|_| Vec::new()).collect();
-            let mut slow_lists: Vec<Vec<(u64, SmallBytes)>> =
-                (0..NUM_SHARDS).map(|_| Vec::new()).collect();
             for m in a_slots {
-                let Some((bits, u_stg, uslow)) = m.into_inner().unwrap() else {
-                    win_bits.push(Vec::new());
-                    continue;
-                };
-                win_bits.push(bits);
-                for (u, v) in u_stg.into_iter().enumerate() {
-                    if !v.is_empty() {
-                        u_lists[u].extend_from_slice(&v);
-                    }
-                }
-                for (k, b) in uslow {
-                    slow_lists[(k >> 56) as usize].push((k, b));
-                }
+                win_bits.push(m.into_inner().unwrap().unwrap_or_default());
             }
 
-            // Phase B: unique user_keys per user-shard -> canonical person ->
-            // pend staging keyed by canon shard.
-            let pend_fast: Vec<Mutex<Vec<(u64, u64)>>> = (0..NUM_SHARDS)
+            // Phase E: emit winners to canon partitions (person identity =
+            // canon_key). Slow canons record their bytes in side_emit so
+            // process_partition can recover the canonical user id.
+            let side_emit: Vec<Mutex<Vec<(u64, SmallBytes)>>> = (0..NUM_SHARDS)
                 .map(|_| Mutex::new(Vec::new()))
                 .collect();
-            let pend_slow: Vec<Mutex<Vec<PendSu>>> = (0..NUM_SHARDS)
-                .map(|_| Mutex::new(Vec::new()))
-                .collect();
-            {
-                let pf = &pend_fast;
-                let ps = &pend_slow;
-                let uref = &u_lists;
-                let sref = &slow_lists;
-                parallel_for(NUM_SHARDS, threads, |u| {
-                    let mut keys = uref[u].clone();
-                    keys.sort_unstable();
-                    keys.dedup();
-                    let mut tmp = [0u8; 9];
-                    let mut push_pend = |user_key: u64, ubytes: SmallBytes| {
-                        let bytes = if ubytes.as_slice().is_empty() {
-                            key_bytes(user_key, b'u', &[], u32::MAX, &mut tmp)
-                        } else {
-                            ubytes.as_slice()
-                        };
-                        let canon = dsu_ref.resolve(bytes);
-                        let (ck, cslow) = field_key(canon, b'u');
-                        let c = (ck >> 56) as usize;
-                        if !cslow && ck != 0 && ubytes.as_slice().is_empty() {
-                            pf[c].lock().unwrap().push((ck, user_key));
-                        } else {
-                            ps[c].lock().unwrap().push(PendSu {
-                                canon_key: ck,
-                                user_key,
-                                canon_bytes: if cslow || ck == 0 {
-                                    SmallBytes::from_slice(canon)
-                                } else {
-                                    SmallBytes::from_slice(&[])
-                                },
-                                user_bytes: ubytes,
-                            });
-                        }
-                    };
-                    for key in keys {
-                        push_pend(key, SmallBytes::from_slice(&[]));
-                    }
-                    for (k, b) in sref[u].iter() {
-                        push_pend(*k, b.clone());
-                    }
-                });
-            }
-
-            // Phase C: per canon shard, intern canonical persons -> user fills.
-            struct COut {
-                shard: CanonShard,
-                ufill: Vec<Vec<(u64, u32)>>,
-                sfill: Vec<Vec<(u64, SmallBytes, u32)>>,
-            }
-            let c_slots: Vec<Mutex<Option<COut>>> = (0..NUM_SHARDS)
-                .map(|_| Mutex::new(None))
-                .collect();
-            {
-                let c_ref = &c_slots;
-                let pf = &pend_fast;
-                let ps = &pend_slow;
-                parallel_for(NUM_SHARDS, threads, |c| {
-                    let mut fast = std::mem::take(&mut *pf[c].lock().unwrap());
-                    fast.sort_unstable();
-                    let mut slow = std::mem::take(&mut *ps[c].lock().unwrap());
-                    slow.sort_unstable_by(|a, b| a.canon_key.cmp(&b.canon_key));
-                    let mut shard = CanonShard::new((fast.len() + slow.len()) / 2 + 8);
-                    let mut ufill: Vec<Vec<(u64, u32)>> =
-                        (0..NUM_SHARDS).map(|_| Vec::new()).collect();
-                    let mut sfill: Vec<Vec<(u64, SmallBytes, u32)>> =
-                        (0..NUM_SHARDS).map(|_| Vec::new()).collect();
-                    let mut tmp = [0u8; 9];
-                    let mut i = 0usize;
-                    while i < fast.len() {
-                        let ck = fast[i].0;
-                        let cb =
-                            key_bytes(ck, b'u', &[], u32::MAX, &mut tmp).to_vec();
-                        let local = shard.intern(ck, &cb, false);
-                        let pidx = ((c as u32) << 24) | local;
-                        while i < fast.len() && fast[i].0 == ck {
-                            ufill[(fast[i].1 >> 56) as usize].push((fast[i].1, pidx));
-                            i += 1;
-                        }
-                    }
-                    let mut j = 0usize;
-                    while j < slow.len() {
-                        let ck = slow[j].canon_key;
-                        let cslow = !slow[j].canon_bytes.as_slice().is_empty();
-                        let cb = if cslow {
-                            slow[j].canon_bytes.clone()
-                        } else {
-                            SmallBytes::from_slice(key_bytes(
-                                ck,
-                                b'u',
-                                &[],
-                                u32::MAX,
-                                &mut tmp,
-                            ))
-                        };
-                        let local = shard.intern(ck, cb.as_slice(), cslow);
-                        let pidx = ((c as u32) << 24) | local;
-                        while j < slow.len()
-                            && slow[j].canon_key == ck
-                            && (slow[j].canon_bytes.as_slice().is_empty()
-                                || slow[j].canon_bytes.as_slice() == cb.as_slice())
-                        {
-                            let e = &slow[j];
-                            let u = (e.user_key >> 56) as usize;
-                            if e.user_bytes.as_slice().is_empty() {
-                                ufill[u].push((e.user_key, pidx));
-                            } else {
-                                sfill[u].push((
-                                    e.user_key,
-                                    e.user_bytes.clone(),
-                                    pidx,
-                                ));
-                            }
-                            j += 1;
-                        }
-                    }
-                    *c_ref[c].lock().unwrap() = Some(COut {
-                        shard,
-                        ufill,
-                        sfill,
-                    });
-                });
-            }
-
-            // Phase D: merge fills, build umaps (parallel) + slow_umaps.
-            let mut canon_shards: Vec<CanonShard> = Vec::with_capacity(NUM_SHARDS);
-            let mut ufill: Vec<Vec<(u64, u32)>> =
-                (0..NUM_SHARDS).map(|_| Vec::new()).collect();
-            let mut sfill: Vec<Vec<(u64, SmallBytes, u32)>> =
-                (0..NUM_SHARDS).map(|_| Vec::new()).collect();
-            for m in c_slots {
-                let out = m.into_inner().unwrap().unwrap();
-                canon_shards.push(out.shard);
-                for (u, v) in out.ufill.into_iter().enumerate() {
-                    if !v.is_empty() {
-                        ufill[u].extend_from_slice(&v);
-                    }
-                }
-                for (u, v) in out.sfill.into_iter().enumerate() {
-                    if !v.is_empty() {
-                        sfill[u].extend(v);
-                    }
-                }
-            }
-            let umap_slots: Vec<Mutex<Option<UMap>>> = (0..NUM_SHARDS)
-                .map(|_| Mutex::new(None))
-                .collect();
-            {
-                let uref = &ufill;
-                let us_ref = &umap_slots;
-                parallel_for(NUM_SHARDS, threads, |u| {
-                    let mut m = UMap::with_capacity(uref[u].len() + 8);
-                    for &(k, v) in uref[u].iter() {
-                        m.insert(k, v);
-                    }
-                    *us_ref[u].lock().unwrap() = Some(m);
-                });
-            }
-            let umaps: Vec<UMap> = umap_slots
-                .into_iter()
-                .map(|m| m.into_inner().unwrap().unwrap())
-                .collect();
-            let slow_umaps: Vec<Vec<SlowUser>> = sfill
-                .into_iter()
-                .map(|fills| {
-                    fills
-                        .into_iter()
-                        .map(|(k, b, p)| SlowUser {
-                            key: k,
-                            bytes: b,
-                            person_idx: p,
-                        })
-                        .collect()
-                })
-                .collect();
-            let t_map = td.elapsed() - t_a;
-
-            // Phase E: emit winners to person partitions.
-            let p_slots: Vec<Mutex<Vec<Vec<Rec12>>>> = (0..NUM_SHARDS)
+            let p_slots: Vec<Mutex<Vec<Vec<Rec16>>>> = (0..NUM_SHARDS)
                 .map(|_| Mutex::new((0..NUM_SHARDS).map(|_| Vec::new()).collect()))
                 .collect();
             {
                 let p_ref = &p_slots;
                 let w_ref = &win_bits;
-                let um_ref = &umaps;
-                let su_ref = &slow_umaps;
+                let se_ref = &side_emit;
                 parallel_for(NUM_SHARDS, threads, |s| {
                     if w_ref[s].is_empty() {
                         return;
                     }
-                    let mut parts: Vec<Vec<Rec12>> =
+                    let mut parts: Vec<Vec<Rec16>> =
                         (0..NUM_SHARDS).map(|_| Vec::new()).collect();
                     emit_shard(
                         &shard_inputs_ref[s][..],
                         &w_ref[s],
-                        um_ref,
-                        su_ref,
+                        link_maps_ref,
+                        dsu_ref,
+                        se_ref,
                         &mut parts,
                         emit_ref,
                     );
                     *p_ref[s].lock().unwrap() = parts;
                 });
             }
-            let survivors: Vec<Vec<Vec<Rec12>>> = p_slots
+            let survivors: Vec<Vec<Vec<Rec16>>> = p_slots
                 .into_iter()
                 .map(|m| m.into_inner().unwrap())
                 .collect();
-            (
-                survivors,
-                canon_shards,
-                umaps,
-                slow_umaps,
-                td.elapsed(),
-                t_map,
-            )
+            let side_emit_v: Vec<Vec<(u64, SmallBytes)>> = side_emit
+                .into_iter()
+                .map(|m| m.into_inner().unwrap())
+                .collect();
+            (survivors, side_emit_v, td.elapsed())
         });
         let tc = std::time::Instant::now();
-        click_parts_res = Some((|| -> io::Result<Vec<Vec<Vec<ClickCand>>>> {
+        click_parts_res = Some((|| -> io::Result<Vec<Vec<Vec<ClickRec>>>> {
         let click_paths = csv_paths(&data_dir.join("clicks"));
         let total_click_bytes: u64 = click_paths
             .iter()
@@ -1400,7 +1203,7 @@ pub fn run_pipeline(
             block_sz,
             threads,
             |_| {
-                (0..NUM_SHARDS).map(|_| Vec::<ClickCand>::new()).collect::<Vec<_>>()
+                (0..NUM_SHARDS).map(|_| Vec::<ClickRec>::new()).collect::<Vec<_>>()
             },
             |parts, line| {
                 let fields = split_fields_csv::<4>(line);
@@ -1421,16 +1224,24 @@ pub fn run_pipeline(
                 if ts < click_min_ts || ts >= window_end {
                     return;
                 }
-                let (uk, _slow_u) = field_key(user_raw, b'u');
-                parts[(uk >> 56) as usize].push(ClickCand {
-                    user: SmallBytes::from_slice(user_raw),
+                // Resolve to canon_key at parse: fast users probe the link
+                // map (miss = self-canonical); rare slow users resolve bytes
+                // through the DSU like emit's slow path.
+                let (uk, uslow) = field_key(user_raw, b'u');
+                let ck = if !uslow && uk != 0 {
+                    link_maps_ref[(uk >> 56) as usize].get(uk).unwrap_or(uk)
+                } else {
+                    field_key(dsu_ref.resolve(user_raw), b'u').0
+                };
+                parts[(ck >> 56) as usize].push(ClickRec {
+                    canon_key: ck,
                     ts,
                     click_id: SmallBytes::from_slice(click_id),
                     camp_id,
                 });
             },
         )?;
-            let mut flat: Vec<Vec<Vec<ClickCand>>> =
+            let mut flat: Vec<Vec<Vec<ClickRec>>> =
                 (0..NUM_SHARDS).map(|_| Vec::new()).collect();
             for mut wp in worker_parts {
                 for (p, bucket) in wp.drain(..).enumerate() {
@@ -1446,79 +1257,30 @@ pub fn run_pipeline(
     });
     std::mem::forget(shard_inputs);
     let t_events = t2.elapsed();
-    let click_parts = click_parts_res.unwrap()?;
+    let click_res = click_parts_res.unwrap()?;
 
-    // Resolve click candidates (partitioned by user shard) to person_idx.
-    let t_cr = std::time::Instant::now();
-    let res_slots: Vec<Mutex<Vec<Vec<ResClick>>>> = (0..NUM_SHARDS)
-        .map(|_| Mutex::new((0..NUM_SHARDS).map(|_| Vec::new()).collect()))
-        .collect();
-    {
-        let cp_ref = &click_parts;
-        let um_ref = &umaps;
-        let su_ref = &slow_umaps;
-        let cs_ref = &canon_shards;
-        let rs_ref = &res_slots;
-        parallel_for(NUM_SHARDS, threads, |u| {
-            let mut res_parts: Vec<Vec<ResClick>> =
-                (0..NUM_SHARDS).map(|_| Vec::new()).collect();
-            // Click users absent from events still resolve through links:
-            // user -> dsu canon -> canon shard lookup.
-            let canon_lookup = |user: &[u8]| -> Option<u32> {
-                let canon = dsu_ref.resolve(user);
-                let (ck, cslow) = field_key(canon, b'u');
-                let c = (ck >> 56) as usize;
-                cs_ref[c]
-                    .get(ck, canon, cslow || ck == 0)
-                    .map(|local| ((c as u32) << 24) | local)
-            };
-            for cand_list in cp_ref[u].iter() {
-                for cand in cand_list {
-                    let user = cand.user.as_slice();
-                    let (uk, uslow) = field_key(user, b'u');
-                    let pidx = if !uslow && uk != 0 {
-                        um_ref[u].get(uk).or_else(|| canon_lookup(user))
-                    } else {
-                        su_ref[u]
-                            .iter()
-                            .find(|s| s.key == uk && s.bytes.as_slice() == user)
-                            .map(|s| s.person_idx)
-                            .or_else(|| canon_lookup(user))
-                    };
-                    let Some(person_idx) = pidx else {
-                        continue;
-                    };
-                    res_parts[(person_idx >> 24) as usize].push(ResClick {
-                        person_idx,
-                        ts: cand.ts,
-                        click_id: cand.click_id.clone(),
-                        camp_id: cand.camp_id,
-                    });
-                }
-            }
-            *rs_ref[u].lock().unwrap() = res_parts;
-        });
-    }
-    let mut click_res: Vec<Vec<Vec<ResClick>>> =
-        (0..NUM_SHARDS).map(|_| Vec::new()).collect();
-    for m in res_slots {
-        for (p, v) in m.into_inner().unwrap().into_iter().enumerate() {
-            if !v.is_empty() {
-                click_res[p].push(v);
-            }
+    // Slow-canon byte side tables = build-time entries (fast users linked to
+    // slow canons) merged with emit-collected ones (slow users' own canons).
+    let mut canon_side: Vec<Vec<(u64, SmallBytes)>> = canon_side_base;
+    for (p, extra) in side_emit_v.into_iter().enumerate() {
+        if !extra.is_empty() {
+            let v = &mut canon_side[p];
+            v.extend(extra);
+            v.sort_unstable_by_key(|e| e.0);
+            v.dedup_by_key(|e| e.0);
         }
     }
-    let t_cres = t_cr.elapsed();
+    let t_cres = std::time::Duration::ZERO;
 
     let t4 = std::time::Instant::now();
     let part_slots: Vec<Mutex<Option<PartResult>>> =
         (0..NUM_SHARDS).map(|_| Mutex::new(None)).collect();
     let survivors_ref = &survivors;
     let click_res_ref = &click_res;
-    let canon_ref = &canon_shards;
+    let canon_ref = &canon_side;
     let part_slots_ref = &part_slots;
     parallel_for(NUM_SHARDS, threads, |p| {
-        let surv_slices: Vec<&[Rec12]> = survivors_ref
+        let surv_slices: Vec<&[Rec16]> = survivors_ref
             .iter()
             .filter_map(|sp| sp.get(p).map(|v| v.as_slice()))
             .filter(|s| !s.is_empty())
@@ -1526,7 +1288,7 @@ pub fn run_pipeline(
         if surv_slices.is_empty() {
             return;
         }
-        let click_slices: Vec<&[ResClick]> = click_res_ref[p]
+        let click_slices: Vec<&[ClickRec]> = click_res_ref[p]
             .iter()
             .map(|v| v.as_slice())
             .filter(|s| !s.is_empty())
@@ -1534,7 +1296,7 @@ pub fn run_pipeline(
         let res = process_partition(
             &surv_slices,
             &click_slices,
-            &canon_ref[p].canon_bytes,
+            &canon_ref[p],
             catalog_ref,
             ws,
             day0,
@@ -1548,7 +1310,6 @@ pub fn run_pipeline(
         .collect();
     let t_sess = t4.elapsed();
     std::mem::forget(survivors);
-    std::mem::forget(click_parts);
     std::mem::forget(click_res);
 
     let t5 = std::time::Instant::now();
@@ -1644,7 +1405,7 @@ pub fn run_pipeline(
         t_ingest.as_secs_f64(),
         t_dedup_wall.as_secs_f64(),
         ins_nanos.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9,
-        t_map_wall.as_secs_f64(),
+        0.0f64,
         emit_nanos.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9,
         t_clicks_wall.as_secs_f64(),
         t_cres.as_secs_f64(),

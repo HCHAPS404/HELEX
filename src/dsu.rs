@@ -118,6 +118,21 @@ impl UnionFind {
             raw_id
         }
     }
+
+    // Number of interned strings; pair_at(i) = (strings[i], canon of i).
+    // After finalize(), min_id_idx[idx] points at the group's minimum id.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.strings.len()
+    }
+
+    #[inline]
+    pub fn pair_at(&self, idx: usize) -> (&[u8], &[u8]) {
+        (
+            self.strings[idx].as_slice(),
+            self.strings[self.min_id_idx[idx] as usize].as_slice(),
+        )
+    }
 }
 
 pub fn csv_paths(folder: &Path) -> Vec<PathBuf> {
