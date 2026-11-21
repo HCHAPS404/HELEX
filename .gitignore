@@ -1,0 +1,9 @@
+target/
+dev/
+out/
+*.zip
+rules.md
+.devin/
+.venv/
+__pycache__/
+*.pyc

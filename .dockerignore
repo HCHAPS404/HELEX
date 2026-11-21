@@ -1,0 +1,9 @@
+target/
+fixtures/
+dev/
+out/
+*.zip
+*.md
+.git/
+.devin/
+scripts/
