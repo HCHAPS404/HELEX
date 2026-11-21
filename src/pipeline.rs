@@ -5,7 +5,6 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use hashbrown::HashTable;
-use rustc_hash::FxHashMap;
 
 use crate::catalog::Catalog;
 use crate::csv_dialect::{parse_fixed_fields, parse_price_cents, split_fields_unquoted};
@@ -24,18 +23,40 @@ const LATE_LIMIT_MS: i64 = 86_400_000;
 const SESSION_GAP_MS: i64 = 1_800_000;
 const CLICK_REACH_MS: i64 = 7 * DAY_MS;
 
-#[derive(Clone, Copy)]
-struct ValidEvent {
-    ts: i64,
-    price_cents: u32,
-    is_purchase: bool,
-    cat_id: u16,
+// Packed event: rel_ms (u32, window-relative) in high bits, then
+// price_cents:24 | cat_id:7 | is_purchase:1 in low bits.
+#[inline]
+fn pack_ev(rel_ms: u32, price_cents: u32, cat_id: u16, is_purchase: bool) -> u64 {
+    (u64::from(rel_ms) << 32)
+        | ((u64::from(price_cents) & 0xFF_FFFF) << 8)
+        | ((u64::from(cat_id) & 0x7F) << 1)
+        | u64::from(is_purchase)
+}
+
+#[inline]
+fn ev_ts(ws: i64, ev: u64) -> i64 {
+    ws + (ev >> 32) as i64
+}
+
+#[inline]
+fn ev_price(ev: u64) -> u32 {
+    ((ev >> 8) & 0xFF_FFFF) as u32
+}
+
+#[inline]
+fn ev_cat(ev: u64) -> u16 {
+    ((ev >> 1) & 0x7F) as u16
+}
+
+#[inline]
+fn ev_purch(ev: u64) -> bool {
+    ev & 1 != 0
 }
 
 struct Survivor {
     person: SmallBytes,
     person_hash: u64,
-    ev: ValidEvent,
+    ev: u64,
 }
 
 struct ClickCand {
@@ -59,38 +80,62 @@ struct CampDayAgg {
     assisted_sessions: i64,
 }
 
-struct ShardDedupSlot {
+const LONG_TAG: u8 = 0xFF;
+const INVALID_TAG: u8 = 0xFE;
+const INVALID_LOC: u64 = u64::MAX;
+
+// Fixed 64-byte dedup record: ids/users <=15B inline, longer values spill to
+// the per-shard side arena encoded as off:u32|len:u32.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct EvRecord {
     ev_hash: u64,
-    buf_idx: u32,
-    id_off: u32,
-    id_len: u32,
-    min_ingest_ts: i64,
-    valid_pos: u64,
+    ingest_ms: i64,
+    id_len: u8,
+    user_len: u8,
+    _pad: [u8; 6],
+    id: [u8; 16],
+    user: [u8; 16],
+    ev: u64,
+}
+const _: () = assert!(std::mem::size_of::<EvRecord>() == 64);
+
+struct ShardBuf {
+    recs: Vec<EvRecord>,
+    side: Vec<u8>,
+}
+
+impl ShardBuf {
+    fn new() -> Self {
+        Self {
+            recs: Vec::new(),
+            side: Vec::new(),
+        }
+    }
+
+    #[inline]
+    fn put_field(&mut self, raw: &[u8], inline: &mut [u8; 16], len_tag: &mut u8) {
+        if raw.len() <= 15 {
+            inline[..raw.len()].copy_from_slice(raw);
+            *len_tag = raw.len() as u8;
+        } else {
+            let off = self.side.len() as u32;
+            self.side.extend_from_slice(raw);
+            inline[..4].copy_from_slice(&off.to_le_bytes());
+            inline[4..8].copy_from_slice(&(raw.len() as u32).to_le_bytes());
+            *len_tag = LONG_TAG;
+        }
+    }
 }
 
 #[inline]
-fn append_shard_record(
-    buf: &mut Vec<u8>,
-    ev_hash: u64,
-    ingest_ms: i64,
-    event_id: &[u8],
-    valid: Option<(&[u8], ValidEvent)>,
-) {
-    buf.extend_from_slice(&ev_hash.to_le_bytes());
-    buf.extend_from_slice(&ingest_ms.to_le_bytes());
-    buf.extend_from_slice(&(event_id.len() as u32).to_le_bytes());
-    buf.extend_from_slice(event_id);
-    match valid {
-        None => buf.push(0u8),
-        Some((person, ev)) => {
-            buf.push(1u8);
-            buf.extend_from_slice(&(person.len() as u32).to_le_bytes());
-            buf.extend_from_slice(person);
-            buf.extend_from_slice(&ev.ts.to_le_bytes());
-            buf.extend_from_slice(&ev.price_cents.to_le_bytes());
-            let packed_cat = (ev.cat_id << 1) | u16::from(ev.is_purchase);
-            buf.extend_from_slice(&packed_cat.to_le_bytes());
-        }
+fn field_bytes<'a>(buf: &'a ShardBuf, raw: &'a [u8; 16], len_tag: u8) -> &'a [u8] {
+    if len_tag == LONG_TAG {
+        let off = u32::from_le_bytes(raw[..4].try_into().unwrap()) as usize;
+        let len = u32::from_le_bytes(raw[4..8].try_into().unwrap()) as usize;
+        &buf.side[off..off + len]
+    } else {
+        &raw[..len_tag as usize]
     }
 }
 
@@ -99,8 +144,7 @@ fn validate_event_copy<'a>(
     fields: [&'a [u8]; 7],
     ingest_ms: i64,
     catalog: &Catalog,
-    _dsu: &'a UnionFind,
-) -> Option<(&'a [u8], ValidEvent)> {
+) -> Option<(&'a [u8], u64)> {
     let user_raw = fields[1];
     if user_raw.is_empty() {
         return None;
@@ -126,26 +170,25 @@ fn validate_event_copy<'a>(
     } else {
         0
     };
-    Some((
-        user_raw,
-        ValidEvent {
-            ts,
-            price_cents,
-            is_purchase,
-            cat_id,
-        },
-    ))
+    let rel_ms = u32::try_from(ts - catalog.window_start).ok()?;
+    Some((user_raw, pack_ev(rel_ms, price_cents, cat_id, is_purchase)))
 }
 
-const INVALID_POS: u64 = u64::MAX;
+struct ShardDedupSlot {
+    ev_hash: u64,
+    min_ingest_ts: i64,
+    id_len: u32,
+    rec_loc: u64,
+    valid_loc: u64,
+}
 
 #[inline]
-fn pack_pos(buf_idx: usize, off: usize) -> u64 {
-    ((buf_idx as u64) << 32) | off as u64
+fn rec_loc(buf_idx: usize, rec_idx: usize) -> u64 {
+    ((buf_idx as u64) << 32) | rec_idx as u64
 }
 
 fn dedup_one_shard(
-    bufs: &[Vec<u8>],
+    bufs: &[ShardBuf],
     dsu: &UnionFind,
     table: &mut HashTable<usize>,
     slots: &mut Vec<ShardDedupSlot>,
@@ -154,84 +197,57 @@ fn dedup_one_shard(
     table.clear();
     slots.clear();
     for (buf_idx, shard_buf) in bufs.iter().enumerate() {
-        let mut pos = 0usize;
-        while pos < shard_buf.len() {
-            let ev_hash =
-                u64::from_le_bytes(shard_buf[pos..pos + 8].try_into().unwrap());
-            let ingest_ms =
-                i64::from_le_bytes(shard_buf[pos + 8..pos + 16].try_into().unwrap());
-            let id_len =
-                u32::from_le_bytes(shard_buf[pos + 16..pos + 20].try_into().unwrap())
-                    as usize;
-            let id_off = pos + 20;
-            let ev_id = &shard_buf[id_off..id_off + id_len];
-            pos = id_off + id_len;
-            let tag = shard_buf[pos];
-            pos += 1;
-            let valid_pos = if tag == 0 {
-                INVALID_POS
-            } else {
-                let v_off = pos;
-                let p_len = u32::from_le_bytes(shard_buf[pos..pos + 4].try_into().unwrap())
-                    as usize;
-                pos += 4 + p_len + 8 + 4 + 2;
-                pack_pos(buf_idx, v_off)
-            };
+        for (rec_idx, rec) in shard_buf.recs.iter().enumerate() {
+            let ev_id = field_bytes(shard_buf, &rec.id, rec.id_len);
+            let id_len = ev_id.len() as u32;
 
-            if let Some(&slot_idx) = table.find(ev_hash, |&idx| {
+            if let Some(&slot_idx) = table.find(rec.ev_hash, |&idx| {
                 let s = &slots[idx];
-                if s.ev_hash != ev_hash || s.id_len as usize != id_len {
+                if s.ev_hash != rec.ev_hash || s.id_len != id_len {
                     return false;
                 }
-                let src = &bufs[s.buf_idx as usize];
-                &src[s.id_off as usize..s.id_off as usize + s.id_len as usize] == ev_id
+                let sb = &bufs[(s.rec_loc >> 32) as usize];
+                let srec = &sb.recs[(s.rec_loc & 0xFFFF_FFFF) as usize];
+                field_bytes(sb, &srec.id, srec.id_len) == ev_id
             }) {
                 let s = &mut slots[slot_idx];
-                if ingest_ms < s.min_ingest_ts {
-                    s.min_ingest_ts = ingest_ms;
-                    s.valid_pos = valid_pos;
+                if rec.ingest_ms < s.min_ingest_ts {
+                    s.min_ingest_ts = rec.ingest_ms;
+                    s.valid_loc = if rec.user_len == INVALID_TAG {
+                        INVALID_LOC
+                    } else {
+                        rec_loc(buf_idx, rec_idx)
+                    };
                 }
             } else {
                 let idx = slots.len();
                 slots.push(ShardDedupSlot {
-                    ev_hash,
-                    buf_idx: buf_idx as u32,
-                    id_off: id_off as u32,
-                    id_len: id_len as u32,
-                    min_ingest_ts: ingest_ms,
-                    valid_pos,
+                    ev_hash: rec.ev_hash,
+                    min_ingest_ts: rec.ingest_ms,
+                    id_len,
+                    rec_loc: rec_loc(buf_idx, rec_idx),
+                    valid_loc: if rec.user_len == INVALID_TAG {
+                        INVALID_LOC
+                    } else {
+                        rec_loc(buf_idx, rec_idx)
+                    },
                 });
-                table.insert_unique(ev_hash, idx, |&i| slots[i].ev_hash);
+                table.insert_unique(rec.ev_hash, idx, |&i| slots[i].ev_hash);
             }
         }
     }
 
     for s in slots.iter() {
-        if s.valid_pos != INVALID_POS {
-            let buf_idx = (s.valid_pos >> 32) as usize;
-            let mut p = (s.valid_pos & 0xFFFF_FFFF) as usize;
-            let shard_buf = &bufs[buf_idx];
-            let p_len =
-                u32::from_le_bytes(shard_buf[p..p + 4].try_into().unwrap()) as usize;
-            p += 4;
-            let person = dsu.resolve(&shard_buf[p..p + p_len]);
-            p += p_len;
-            let ts = i64::from_le_bytes(shard_buf[p..p + 8].try_into().unwrap());
-            let price_cents =
-                u32::from_le_bytes(shard_buf[p + 8..p + 12].try_into().unwrap());
-            let packed_cat =
-                u16::from_le_bytes(shard_buf[p + 12..p + 14].try_into().unwrap());
+        if s.valid_loc != INVALID_LOC {
+            let buf = &bufs[(s.valid_loc >> 32) as usize];
+            let rec = &buf.recs[(s.valid_loc & 0xFFFF_FFFF) as usize];
+            let person = dsu.resolve(field_bytes(buf, &rec.user, rec.user_len));
             let person_hash = hash64_bytes(person);
             let part = (person_hash >> 56) as usize;
             parts[part].push(Survivor {
                 person: SmallBytes::from_slice(person),
                 person_hash,
-                ev: ValidEvent {
-                    ts,
-                    price_cents,
-                    is_purchase: (packed_cat & 1) != 0,
-                    cat_id: packed_cat >> 1,
-                },
+                ev: rec.ev,
             });
         }
     }
@@ -240,7 +256,7 @@ fn dedup_one_shard(
 struct PersonTable {
     table: HashTable<u32>,
     keys: Vec<SmallBytes>,
-    events: Vec<Vec<ValidEvent>>,
+    events: Vec<Vec<u64>>,
     clicks: Vec<Vec<ClickItem>>,
 }
 
@@ -255,7 +271,7 @@ impl PersonTable {
     }
 
     #[inline]
-    fn push_event(&mut self, person: SmallBytes, person_hash: u64, ev: ValidEvent) {
+    fn push_event(&mut self, person: SmallBytes, person_hash: u64, ev: u64) {
         let keys = &self.keys;
         if let Some(&idx) = self
             .table
@@ -285,7 +301,10 @@ fn process_partition(
     surv_slices: &[&[Survivor]],
     click_slices: &[&[ClickCand]],
     catalog: &Catalog,
-) -> (Vec<UserDailyRow>, FxHashMap<(u16, i32), CampDayAgg>) {
+    ws: i64,
+    day0: i32,
+    num_days: usize,
+) -> (Vec<UserDailyRow>, Vec<(u32, CampDayAgg)>) {
     let est: usize = surv_slices.iter().map(|s| s.len()).sum::<usize>() / 24 + 16;
     let mut pt = PersonTable::new(est);
     for slice in surv_slices {
@@ -308,8 +327,7 @@ fn process_partition(
 
     let num_cats = catalog.categories.len();
     let num_camps_with_org = catalog.campaign_ids.len();
-    let mut camp_daily_map: FxHashMap<(u16, i32), CampDayAgg> =
-        FxHashMap::with_capacity_and_hasher(num_camps_with_org * 4, Default::default());
+    let mut camp_grid = vec![CampDayAgg::default(); num_camps_with_org * num_days];
     let mut user_rows: Vec<UserDailyRow> = Vec::with_capacity(pt.keys.len() * 2);
     let mut camp_counts = vec![0u32; num_camps_with_org];
     let mut in_active = vec![false; num_camps_with_org];
@@ -319,7 +337,7 @@ fn process_partition(
     for ((person, mut evs), mut clicks) in
         pt.keys.into_iter().zip(pt.events).zip(pt.clicks)
     {
-        evs.sort_unstable_by_key(|e| e.ts);
+        evs.sort_unstable();
 
         if !clicks.is_empty() {
             clicks.sort_unstable_by(|a, b| {
@@ -339,7 +357,7 @@ fn process_partition(
 
         let mut idx = 0usize;
         while idx < evs.len() {
-            let sess_start = evs[idx].ts;
+            let sess_start = ev_ts(ws, evs[idx]);
             let mut prev_ts = sess_start;
             let mut sess_events: i64 = 0;
             let mut sess_rev: i64 = 0;
@@ -377,16 +395,17 @@ fn process_partition(
 
             while idx < evs.len() {
                 let e = evs[idx];
-                if e.ts - prev_ts > SESSION_GAP_MS {
+                let ts = ev_ts(ws, e);
+                if ts - prev_ts > SESSION_GAP_MS {
                     break;
                 }
-                prev_ts = e.ts;
+                prev_ts = ts;
                 sess_events += 1;
-                if e.is_purchase {
+                if ev_purch(e) {
                     sess_has_purchase = true;
-                    let p = i64::from(e.price_cents);
+                    let p = i64::from(ev_price(e));
                     sess_rev += p;
-                    day_cat_rev[e.cat_id as usize] += e.price_cents as u64;
+                    day_cat_rev[ev_cat(e) as usize] += u64::from(ev_price(e));
                 }
                 idx += 1;
             }
@@ -411,10 +430,10 @@ fn process_partition(
                 left += 1;
             }
 
+            let day_i = (sess_day - day0) as usize;
             if left == right {
-                let agg = camp_daily_map
-                    .entry((catalog.organic_camp_id, sess_day))
-                    .or_default();
+                let agg =
+                    &mut camp_grid[catalog.organic_camp_id as usize * num_days + day_i];
                 agg.sessions += 1;
                 if sess_has_purchase {
                     agg.purchasing_sessions += 1;
@@ -423,7 +442,7 @@ fn process_partition(
             } else {
                 let win_camp = clicks[right - 1].camp_id;
                 {
-                    let agg = camp_daily_map.entry((win_camp, sess_day)).or_default();
+                    let agg = &mut camp_grid[win_camp as usize * num_days + day_i];
                     agg.sessions += 1;
                     if sess_has_purchase {
                         agg.purchasing_sessions += 1;
@@ -437,10 +456,7 @@ fn process_partition(
                         in_active[cid as usize] = false;
                         active_camps.swap_remove(k);
                     } else {
-                        camp_daily_map
-                            .entry((cid, sess_day))
-                            .or_default()
-                            .assisted_sessions += 1;
+                        camp_grid[cid as usize * num_days + day_i].assisted_sessions += 1;
                         k += 1;
                     }
                 }
@@ -479,10 +495,16 @@ fn process_partition(
         active_camps.clear();
     }
 
-    (user_rows, camp_daily_map)
+    let mut sparse: Vec<(u32, CampDayAgg)> = Vec::new();
+    for (i, agg) in camp_grid.iter().enumerate() {
+        if agg.sessions != 0 || agg.assisted_sessions != 0 {
+            sparse.push((i as u32, *agg));
+        }
+    }
+    (user_rows, sparse)
 }
 
-type PartResult = (Vec<UserDailyRow>, FxHashMap<(u16, i32), CampDayAgg>);
+type PartResult = (Vec<UserDailyRow>, Vec<(u32, CampDayAgg)>);
 
 pub fn run_pipeline(
     data_dir: &Path,
@@ -493,6 +515,21 @@ pub fn run_pipeline(
     let t0 = std::time::Instant::now();
     let threads = worker_count();
     let catalog = Catalog::load(data_dir)?;
+    if catalog.categories.len() > 127 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "category count exceeds packed-event capacity",
+        ));
+    }
+    if catalog.window_end - catalog.window_start > i64::from(u32::MAX) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "window exceeds packed-event capacity",
+        ));
+    }
+    let ws = catalog.window_start;
+    let day0 = ws.div_euclid(DAY_MS) as i32;
+    let num_days = ((catalog.window_end - 1).div_euclid(DAY_MS) as i32 - day0) as usize + 1;
     let t_cat = t0.elapsed();
 
     let t1 = std::time::Instant::now();
@@ -511,7 +548,7 @@ pub fn run_pipeline(
     let catalog_ref = &catalog;
     let dsu_ref = &dsu;
 
-    let shard_inputs: Vec<Vec<Vec<u8>>> = if !spill {
+    let shard_inputs: Vec<Vec<ShardBuf>> = if !spill {
         let block_sz = if total_event_bytes >= (64 << 20) {
             4 << 20
         } else {
@@ -522,7 +559,9 @@ pub fn run_pipeline(
             block_sz,
             threads,
             |_| {
-                (0..NUM_SHARDS).map(|_| Vec::<u8>::new()).collect::<Vec<_>>()
+                (0..NUM_SHARDS)
+                    .map(|_| ShardBuf::new())
+                    .collect::<Vec<_>>()
             },
             |shards, line, ascii| {
                 let fields = if ascii && memchr::memchr(b'"', line).is_none() {
@@ -541,15 +580,29 @@ pub fn run_pipeline(
                     return;
                 };
                 let ev_hash = hash64_bytes(event_id);
-                let shard = (ev_hash >> 56) as usize;
-                let valid = validate_event_copy(fields, ingest_ms, catalog_ref, dsu_ref);
-                append_shard_record(&mut shards[shard], ev_hash, ingest_ms, event_id, valid);
+                let sb = &mut shards[(ev_hash >> 56) as usize];
+                let mut rec = EvRecord {
+                    ev_hash,
+                    ingest_ms,
+                    id_len: 0,
+                    user_len: INVALID_TAG,
+                    _pad: [0; 6],
+                    id: [0; 16],
+                    user: [0; 16],
+                    ev: 0,
+                };
+                sb.put_field(event_id, &mut rec.id, &mut rec.id_len);
+                if let Some((user, ev)) = validate_event_copy(fields, ingest_ms, catalog_ref) {
+                    sb.put_field(user, &mut rec.user, &mut rec.user_len);
+                    rec.ev = ev;
+                }
+                sb.recs.push(rec);
             },
         )?;
-        let mut flat: Vec<Vec<Vec<u8>>> = (0..NUM_SHARDS).map(|_| Vec::new()).collect();
+        let mut flat: Vec<Vec<ShardBuf>> = (0..NUM_SHARDS).map(|_| Vec::new()).collect();
         for mut ws in worker_shards {
             for (s, buf) in ws.drain(..).enumerate() {
-                if !buf.is_empty() {
+                if !buf.recs.is_empty() {
                     flat[s].push(buf);
                 }
             }
@@ -575,7 +628,7 @@ pub fn run_pipeline(
             &event_paths,
             block_sz,
             threads,
-            |_| Vec::<u8>::with_capacity(96),
+            |_| ShardBuf::new(),
             |tmp, line, ascii| {
                 let fields = if ascii && memchr::memchr(b'"', line).is_none() {
                     split_fields_unquoted::<7>(line)
@@ -594,20 +647,39 @@ pub fn run_pipeline(
                 };
                 let ev_hash = hash64_bytes(event_id);
                 let shard = (ev_hash >> 56) as usize;
-                let valid = validate_event_copy(fields, ingest_ms, catalog_ref, dsu_ref);
-                tmp.clear();
-                append_shard_record(tmp, ev_hash, ingest_ms, event_id, valid);
-                writers_ref[shard]
-                    .lock()
-                    .unwrap()
-                    .write_all(tmp)
+                let mut rec = EvRecord {
+                    ev_hash,
+                    ingest_ms,
+                    id_len: 0,
+                    user_len: INVALID_TAG,
+                    _pad: [0; 6],
+                    id: [0; 16],
+                    user: [0; 16],
+                    ev: 0,
+                };
+                tmp.put_field(event_id, &mut rec.id, &mut rec.id_len);
+                if let Some((user, ev)) = validate_event_copy(fields, ingest_ms, catalog_ref) {
+                    tmp.put_field(user, &mut rec.user, &mut rec.user_len);
+                    rec.ev = ev;
+                }
+                let rec_bytes: &[u8] = unsafe {
+                    std::slice::from_raw_parts(
+                        &rec as *const EvRecord as *const u8,
+                        std::mem::size_of::<EvRecord>(),
+                    )
+                };
+                let mut w = writers_ref[shard].lock().unwrap();
+                w.write_all(rec_bytes).expect("spill write failed");
+                w.write_all(&(tmp.side.len() as u32).to_le_bytes())
                     .expect("spill write failed");
+                w.write_all(&tmp.side).expect("spill write failed");
+                tmp.side.clear();
             },
         )?;
         for w in writers {
             w.into_inner().unwrap().flush()?;
         }
-        let flat: Vec<Vec<Vec<u8>>> = (0..NUM_SHARDS)
+        let flat: Vec<Vec<ShardBuf>> = (0..NUM_SHARDS)
             .map(|s| {
                 let p = spill_dir.join(format!("s{s:03}.bin"));
                 fs::read(&p).unwrap_or_default()
@@ -616,7 +688,34 @@ pub fn run_pipeline(
                 if b.is_empty() {
                     Vec::new()
                 } else {
-                    vec![b]
+                    let mut sb = ShardBuf::new();
+                    let mut pos = 0usize;
+                    while pos + 68 <= b.len() {
+                        let mut rec: EvRecord = unsafe {
+                            std::ptr::read_unaligned(b[pos..].as_ptr() as *const EvRecord)
+                        };
+                        pos += 64;
+                        let side_len =
+                            u32::from_le_bytes(b[pos..pos + 4].try_into().unwrap())
+                                as usize;
+                        pos += 4;
+                        let base = sb.side.len() as u32;
+                        sb.side.extend_from_slice(&b[pos..pos + side_len]);
+                        pos += side_len;
+                        if rec.id_len == LONG_TAG {
+                            let off =
+                                u32::from_le_bytes(rec.id[..4].try_into().unwrap()) + base;
+                            rec.id[..4].copy_from_slice(&off.to_le_bytes());
+                        }
+                        if rec.user_len == LONG_TAG {
+                            let off =
+                                u32::from_le_bytes(rec.user[..4].try_into().unwrap())
+                                    + base;
+                            rec.user[..4].copy_from_slice(&off.to_le_bytes());
+                        }
+                        sb.recs.push(rec);
+                    }
+                    vec![sb]
                 }
             })
             .collect();
@@ -634,7 +733,7 @@ pub fn run_pipeline(
         if bufs.is_empty() {
             return;
         }
-        let est = (bufs.iter().map(|b| b.len()).sum::<usize>() / 44).max(64);
+        let est = bufs.iter().map(|b| b.recs.len()).sum::<usize>().max(64);
         let mut table = HashTable::with_capacity(est * 2);
         let mut slots: Vec<ShardDedupSlot> = Vec::with_capacity(est);
         let mut parts: Vec<Vec<Survivor>> =
@@ -647,6 +746,25 @@ pub fn run_pipeline(
         .map(|m| m.into_inner().unwrap().unwrap_or_default())
         .collect();
     drop(shard_inputs);
+
+    // Bloom filter over canonical persons with >=1 surviving event; rejects
+    // clicks whose user has no events before they touch partition vectors.
+    const BLOOM_BITS: usize = 1 << 24;
+    let mut bloom = vec![0u64; BLOOM_BITS / 64];
+    for sp in &survivors {
+        for part in sp {
+            for s in part {
+                let h = s.person_hash;
+                let m = BLOOM_BITS - 1;
+                let b1 = (h as usize) & m;
+                let b2 = ((h >> 32) as usize ^ (h as usize >> 16)) & m;
+                let b3 = (h.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40) as usize & m;
+                bloom[b1 >> 6] |= 1u64 << (b1 & 63);
+                bloom[b2 >> 6] |= 1u64 << (b2 & 63);
+                bloom[b3 >> 6] |= 1u64 << (b3 & 63);
+            }
+        }
+    }
     let t_events = t2.elapsed();
 
     let t3 = std::time::Instant::now();
@@ -663,6 +781,7 @@ pub fn run_pipeline(
             1 << 20
         };
         let window_end = catalog.window_end;
+        let bloom_ref = &bloom;
         let worker_parts = process_csv_files_parallel(
             &click_paths,
             block_sz,
@@ -694,8 +813,18 @@ pub fn run_pipeline(
                     return;
                 }
                 let person = SmallBytes::from_slice(dsu_ref.resolve(user_raw));
-                let part = (person.hash64() >> 56) as usize;
-                parts[part].push(ClickCand {
+                let ph = person.hash64();
+                let m = BLOOM_BITS - 1;
+                let b1 = (ph as usize) & m;
+                let b2 = ((ph >> 32) as usize ^ (ph as usize >> 16)) & m;
+                let b3 = (ph.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40) as usize & m;
+                if bloom_ref[b1 >> 6] & (1u64 << (b1 & 63)) == 0
+                    || bloom_ref[b2 >> 6] & (1u64 << (b2 & 63)) == 0
+                    || bloom_ref[b3 >> 6] & (1u64 << (b3 & 63)) == 0
+                {
+                    return;
+                }
+                parts[(ph >> 56) as usize].push(ClickCand {
                     person,
                     ts,
                     click_id: SmallBytes::from_slice(click_id),
@@ -736,7 +865,14 @@ pub fn run_pipeline(
             .map(|v| v.as_slice())
             .filter(|s| !s.is_empty())
             .collect();
-        let res = process_partition(&surv_slices, &click_slices, catalog_ref);
+        let res = process_partition(
+            &surv_slices,
+            &click_slices,
+            catalog_ref,
+            ws,
+            day0,
+            num_days,
+        );
         *part_slots_ref[p].lock().unwrap() = Some(res);
     });
     let all_part_results: Vec<PartResult> = part_slots
@@ -751,13 +887,14 @@ pub fn run_pipeline(
     let user_dir = out_dir.join("user_daily");
     fs::create_dir_all(&user_dir)?;
 
-    let mut camp_daily_map: FxHashMap<(u16, i32), CampDayAgg> =
-        FxHashMap::with_capacity_and_hasher(4096, Default::default());
+    let num_camps_with_org = catalog.campaign_ids.len();
+    let mut camp_grid_global =
+        vec![CampDayAgg::default(); num_camps_with_org * num_days];
     let mut total_user_rows = 0usize;
-    for (rows, map) in &all_part_results {
+    for (rows, sparse) in &all_part_results {
         total_user_rows += rows.len();
-        for (&k, &agg) in map.iter() {
-            let e = camp_daily_map.entry(k).or_default();
+        for &(cell, agg) in sparse {
+            let e = &mut camp_grid_global[cell as usize];
             e.sessions += agg.sessions;
             e.purchasing_sessions += agg.purchasing_sessions;
             e.revenue_cents += agg.revenue_cents;
@@ -798,12 +935,15 @@ pub fn run_pipeline(
         });
     }
 
-    let mut camp_rows: Vec<CampaignDailyRow> = Vec::with_capacity(camp_daily_map.len());
-    for ((cid, day), agg) in camp_daily_map {
+    let mut camp_rows: Vec<CampaignDailyRow> =
+        Vec::with_capacity(num_camps_with_org * num_days / 4);
+    for (cell, agg) in camp_grid_global.iter().enumerate() {
         if agg.sessions > 0 || agg.assisted_sessions > 0 {
+            let cid = cell / num_days;
+            let day = day0 + (cell % num_days) as i32;
             camp_rows.push(CampaignDailyRow {
-                campaign_id: catalog.campaign_ids[cid as usize].clone(),
-                channel: catalog.campaign_channels[cid as usize].clone(),
+                campaign_id: catalog.campaign_ids[cid].clone(),
+                channel: catalog.campaign_channels[cid].clone(),
                 day,
                 sessions: agg.sessions,
                 purchasing_sessions: agg.purchasing_sessions,
