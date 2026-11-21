@@ -1,6 +1,7 @@
 mod catalog;
 mod csv_dialect;
 mod dsu;
+mod io_pool;
 mod mem_guard;
 mod parquet_out;
 mod pipeline;

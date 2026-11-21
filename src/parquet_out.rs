@@ -157,7 +157,7 @@ const BATCH_ROWS: usize = 65_536;
 
 pub fn write_user_daily_part(
     path: &Path,
-    rows: &[UserDailyRow],
+    parts: &[&[UserDailyRow]],
     categories: &[Vec<u8>],
 ) -> io::Result<()> {
     let file = BufWriter::with_capacity(1 << 20, File::create(path)?);
@@ -166,15 +166,17 @@ pub fn write_user_daily_part(
     let mut writer = SerializedFileWriter::new(file, schema, props)
         .map_err(|e| io::Error::other(e.to_string()))?;
 
-    let mut user_ids = Vec::with_capacity(BATCH_ROWS.min(rows.len()));
-    let mut days = Vec::with_capacity(BATCH_ROWS.min(rows.len()));
-    let mut sessions = Vec::with_capacity(BATCH_ROWS.min(rows.len()));
-    let mut events = Vec::with_capacity(BATCH_ROWS.min(rows.len()));
-    let mut revenues = Vec::with_capacity(BATCH_ROWS.min(rows.len()));
-    let mut cat_defs = Vec::with_capacity(BATCH_ROWS.min(rows.len()));
-    let mut cat_vals = Vec::with_capacity(BATCH_ROWS.min(rows.len()));
+    let total: usize = parts.iter().map(|p| p.len()).sum();
+    let cap = BATCH_ROWS.min(total);
+    let mut user_ids = Vec::with_capacity(cap);
+    let mut days = Vec::with_capacity(cap);
+    let mut sessions = Vec::with_capacity(cap);
+    let mut events = Vec::with_capacity(cap);
+    let mut revenues = Vec::with_capacity(cap);
+    let mut cat_defs = Vec::with_capacity(cap);
+    let mut cat_vals = Vec::with_capacity(cap);
 
-    for chunk in rows.chunks(BATCH_ROWS) {
+    for chunk in parts.iter().flat_map(|p| p.chunks(BATCH_ROWS)) {
         user_ids.clear();
         days.clear();
         sessions.clear();

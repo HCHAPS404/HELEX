@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 
 use hashbrown::HashTable;
 
-use crate::csv_dialect::{iter_data_lines, parse_fixed_fields};
+use crate::csv_dialect::parse_fixed_fields;
+use crate::io_pool::process_csv_files_parallel;
 use crate::sso::{hash64_bytes, SmallBytes};
 
 pub struct UnionFind {
@@ -27,17 +28,13 @@ impl UnionFind {
     }
 
     #[inline]
-    pub fn intern(&mut self, s: &[u8]) -> u32 {
-        let hash = hash64_bytes(s);
+    pub fn intern_small(&mut self, sb: SmallBytes, hash: u64) -> u32 {
         let strings = &self.strings;
-        if let Some(&idx) = self
-            .table
-            .find(hash, |&idx| strings[idx as usize].eq_slice(s))
-        {
+        if let Some(&idx) = self.table.find(hash, |&idx| strings[idx as usize] == sb) {
             return idx;
         }
         let idx = self.strings.len() as u32;
-        self.strings.push(SmallBytes::from_slice(s));
+        self.strings.push(sb);
         self.parent.push(idx);
         self.size.push(1);
         self.min_id_idx.push(idx);
@@ -45,6 +42,32 @@ impl UnionFind {
         self.table
             .insert_unique(hash, idx, |&i| strings[i as usize].hash64());
         idx
+    }
+
+    #[inline]
+    pub fn union_small(&mut self, a: SmallBytes, ha: u64, b: SmallBytes, hb: u64) {
+        if a == b {
+            self.intern_small(a, ha);
+            return;
+        }
+        let ia = self.intern_small(a, ha);
+        let ib = self.intern_small(b, hb);
+        let ra = self.find_index(ia);
+        let rb = self.find_index(ib);
+        if ra == rb {
+            return;
+        }
+        let sa = self.size[ra as usize];
+        let sb = self.size[rb as usize];
+        let (root, child) = if sa < sb { (rb, ra) } else { (ra, rb) };
+        self.parent[child as usize] = root;
+        self.size[root as usize] = sa + sb;
+
+        let root_min = self.min_id_idx[root as usize];
+        let child_min = self.min_id_idx[child as usize];
+        if self.strings[child_min as usize] < self.strings[root_min as usize] {
+            self.min_id_idx[root as usize] = child_min;
+        }
     }
 
     #[inline]
@@ -62,30 +85,14 @@ impl UnionFind {
         root
     }
 
-    #[inline]
+    #[cfg(test)]
     pub fn union_bytes(&mut self, a: &[u8], b: &[u8]) {
-        if a == b {
-            self.intern(a);
-            return;
-        }
-        let ia = self.intern(a);
-        let ib = self.intern(b);
-        let ra = self.find_index(ia);
-        let rb = self.find_index(ib);
-        if ra == rb {
-            return;
-        }
-        let sa = self.size[ra as usize];
-        let sb = self.size[rb as usize];
-        let (root, child) = if sa < sb { (rb, ra) } else { (ra, rb) };
-        self.parent[child as usize] = root;
-        self.size[root as usize] = sa + sb;
-
-        let root_min = self.min_id_idx[root as usize];
-        let child_min = self.min_id_idx[child as usize];
-        if self.strings[child_min as usize] < self.strings[root_min as usize] {
-            self.min_id_idx[root as usize] = child_min;
-        }
+        self.union_small(
+            SmallBytes::from_slice(a),
+            hash64_bytes(a),
+            SmallBytes::from_slice(b),
+            hash64_bytes(b),
+        );
     }
 
     pub fn finalize(&mut self) {
@@ -125,23 +132,43 @@ pub fn csv_paths(folder: &Path) -> Vec<PathBuf> {
     out
 }
 
-pub fn load_links(data_dir: &Path) -> io::Result<UnionFind> {
+pub fn load_links(data_dir: &Path, threads: usize) -> io::Result<UnionFind> {
     let paths = csv_paths(&data_dir.join("links"));
     let total_bytes: u64 = paths
         .iter()
         .filter_map(|p| p.metadata().ok().map(|m| m.len()))
         .sum();
     let est_ids = ((total_bytes / 12) as usize).clamp(16, 4_000_000);
-    let mut uf = UnionFind::with_capacity(est_ids);
-    for path in paths {
-        let bytes = fs::read(path)?;
-        iter_data_lines(&bytes, |line| {
+    let block_sz = if total_bytes >= (64 << 20) {
+        4 << 20
+    } else {
+        1 << 20
+    };
+
+    let worker_pairs = process_csv_files_parallel(
+        &paths,
+        block_sz,
+        threads,
+        |_| Vec::<(SmallBytes, u64, SmallBytes, u64)>::with_capacity(est_ids / threads.max(1) + 64),
+        |pairs, line| {
             if let Some([a, b]) = parse_fixed_fields::<2>(line) {
                 if !a.is_empty() && !b.is_empty() {
-                    uf.union_bytes(a, b);
+                    pairs.push((
+                        SmallBytes::from_slice(a),
+                        hash64_bytes(a),
+                        SmallBytes::from_slice(b),
+                        hash64_bytes(b),
+                    ));
                 }
             }
-        });
+        },
+    )?;
+
+    let mut uf = UnionFind::with_capacity(est_ids);
+    for pairs in worker_pairs {
+        for (a, ha, b, hb) in pairs {
+            uf.union_small(a, ha, b, hb);
+        }
     }
     uf.finalize();
     Ok(uf)
