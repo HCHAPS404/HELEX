@@ -2,6 +2,8 @@ target/
 fixtures/
 dev/
 out/
+pipeline/
+requirements.txt
 *.zip
 *.md
 .git/

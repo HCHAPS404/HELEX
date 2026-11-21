@@ -130,6 +130,8 @@ def main() -> int:
             exp_c = load_expected(ans_dir / "campaign_daily.csv", SCHEMAS["campaign_daily"])
             compare_tables("dev-1M", act_u, act_c, exp_u, exp_c)
             print(f"ok   dev-1M ({dt:.3f}s, user_daily={act_u.height}, campaign_daily={act_c.height})")
+            del act_u, act_c, exp_u, exp_c
+            shutil.rmtree(out_dev, ignore_errors=True)
 
         for seed in DEFAULT_SEEDS:
             seed_data = tmp / f"data_s{seed}"
@@ -166,6 +168,8 @@ def main() -> int:
                     "DATA_DIR": seed_data.as_posix(),
                     "OUTPUT_DIR": out_ref.as_posix(),
                     "SCRATCH_DIR": scr_ref.as_posix(),
+                    "NCPU": "4",
+                    "MEM_GB": "2",
                 }
                 subprocess.run(args.oracle, env=env_ref, check=True)
                 exp_u = load_actual(out_ref / "user_daily", SCHEMAS["user_daily"])
