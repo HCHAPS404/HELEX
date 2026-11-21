@@ -67,3 +67,27 @@ Unified 48B record replacing 64B `EvRecord`:
 - `user_key:u64` same scheme; bytes recovered in emit via leading_zeros.
 - Open-addressing table (u64 key -> u32 idx) with min-ingest winner,
   sequential per shard, no generic hashbrown.
+
+### Session: E2 canon_key refactor + record shrink (results)
+
+- **E2 shipped (`db67101`)**: person identity = canon_key u64. Deleted
+  collect/sort/unique/resolve/intern/umap-fill phases and the whole cres
+  stage (~0.3s). `build_link_maps` (u64->u64 per user shard + slow-canon
+  side bytes) rides inside the DSU window. Emit/clicks probe linkmap;
+  miss = self-canonical; slow ids resolve via dsu.resolve directly.
+  Verified: 8/8, 36/36, dev-1M bit-exact, 5 seeds, invariants 5/5.
+  Modal: total 1.595 -> ~1.26-1.32s; dedup wall 0.51 -> 0.26; map=0.00.
+- **EvRecord 48B -> 40B (`8255217`)**: invalid flag packed into ingest
+  bit0 (ingest_ms<<1|inv). Modal fast node: ingest ~0.70 -> 0.35-0.52,
+  internal ~0.92-1.05s, RSS 3.1GB -> 2.85GB.
+- **Fused dedup+emit per shard (`6f4c69e`)**: emit[s] runs right after
+  insert[s]; win_bits stays thread-local (no phase barrier, no global
+  win_bits vector). Structurally better tail latency; correctness
+  identical. HEAD candidate for submit.
+- **A-fixes (`a4ea648`)**: per-worker shard reserve (/threads) ->
+  max_rss 7.4GB -> 3.24GB at 20M; links on 2 threads; mem::forget on exit.
+- **Measured neutral/worse, reverted**: emit linkmap prefetch (emit_cpu
+  1.33->1.55), 8-wide batch probes (1.35->1.48), NUM_SHARDS=128
+  (sess 0.19->0.38), PGO MSVC->musl (median 1.39 vs 1.30 baseline, noise).
+- Emit is now the dominant term: ~70ns/winner = bit scan + 40B rec read
+  + linkmap probe (~L3) + staged 16B write. ins_cpu ~0.65s CPU is second.
