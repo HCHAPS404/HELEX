@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # HELEX — Shopping Sessions 4 (Rust engine)
 
 Implementación nativa en Rust del benchmark `shopping-sessions-4`. Reemplaza
@@ -116,8 +115,14 @@ bytes), más RSS/páginas comprometidas.
 
 Plan completo por etapas: ver `BENCHMARKS.md` y el historial de commits de
 `HCHAPS404-DEVELOP` (mensajes documentan cada experimento y su resultado).
-=======
-# HELEX Shopping Sessions Pipeline
+
+---
+
+## Pipeline legacy (DuckDB) — descripción original de Alex
+
+> Nota: el motor de producción actual es el pipeline Rust de arriba.
+> Se conserva esta sección como referencia del enfoque anterior.
+
 
 This submission implements the Shopping Sessions specification in
 `rules.md`. It combines a Rust CSV and identity preprocessor with DuckDB
@@ -144,4 +149,3 @@ python3 scripts/run_fixtures.py fixtures -- python3 pipeline/pipeline.py
 - `MEM_GB`: memory limit
 
 The container entrypoint is [run.sh](/workspaces/HELEX/run.sh).
->>>>>>> origin/main
