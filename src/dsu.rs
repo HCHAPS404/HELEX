@@ -4,11 +4,15 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::csv_dialect::{iter_data_lines, split_fields_csv};
-use crate::keys::{fast_key_bytes, id_key, is_slow, KeyMap};
+use crate::keys::{fast_key_bytes, id_key, is_slow, mix64, KeyMap};
 
 /// Linked-ID resolution on u64 user keys: user key -> canonical person key
 /// (the byte-wise smallest ID of its linked set).
 pub struct Dsu {
+    /// Bloom-style bit filter over member keys: most users are unlinked and
+    /// skip the map probe.
+    filter: Vec<u64>,
+    fbits: u32,
     map: KeyMap,
     canon: Vec<u64>,
     /// Slow-form member keys with their bytes (for output / registry).
@@ -19,6 +23,10 @@ impl Dsu {
     #[inline(always)]
     pub fn resolve(&self, user_key: u64) -> u64 {
         if self.canon.is_empty() {
+            return user_key;
+        }
+        let h = (mix64(user_key) >> (64 - self.fbits)) as usize;
+        if unsafe { *self.filter.get_unchecked(h >> 6) } & (1u64 << (h & 63)) == 0 {
             return user_key;
         }
         match self.map.get(user_key) {
@@ -146,12 +154,17 @@ pub fn load_links(data_dir: &Path) -> io::Result<Dsu> {
     let n = uf.keys.len();
     let mut map = KeyMap::with_capacity(n.max(1));
     let mut canon: Vec<u64> = Vec::new();
+    let fbits = ((n.max(1) * 16).next_power_of_two().trailing_zeros()).clamp(12, 30);
+    let mut filter = vec![0u64; (1usize << fbits) / 64];
     for i in 0..n as u32 {
         let r = uf.find(i);
         let m = uf.min_of[r as usize];
         if m != i {
-            map.insert(uf.keys[i as usize], canon.len() as u32);
+            let k = uf.keys[i as usize];
+            map.insert(k, canon.len() as u32);
             canon.push(uf.keys[m as usize]);
+            let h = (mix64(k) >> (64 - fbits)) as usize;
+            filter[h >> 6] |= 1u64 << (h & 63);
         }
     }
     let slow_bytes = uf
@@ -162,6 +175,8 @@ pub fn load_links(data_dir: &Path) -> io::Result<Dsu> {
         .collect::<Vec<_>>();
     debug_assert!(slow_bytes.iter().all(|(k, _)| is_slow(*k)));
     Ok(Dsu {
+        filter,
+        fbits,
         map,
         canon,
         slow_bytes,

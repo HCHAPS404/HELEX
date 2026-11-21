@@ -62,16 +62,18 @@ fn has_avx2() -> bool {
 
 impl Masks {
     fn build(&mut self, b: &[u8]) {
-        let words = b.len().div_ceil(64) + 1;
+        let words = b.len().div_ceil(64) + 2;
         if self.nl.len() < words {
             self.nl.resize(words, 0);
             self.comma.resize(words, 0);
             self.quote.resize(words, 0);
         }
         let last = b.len().div_ceil(64);
-        self.nl[last] = 0;
-        self.comma[last] = 0;
-        self.quote[last] = 0;
+        for k in last..last + 2 {
+            self.nl[k] = 0;
+            self.comma[k] = 0;
+            self.quote[k] = 0;
+        }
         #[cfg(target_arch = "x86_64")]
         if has_avx2() {
             unsafe { build_avx2(b, &mut self.nl, &mut self.comma, &mut self.quote) };
@@ -129,6 +131,28 @@ fn any_in(mask: &[u64], s: usize, e: usize) -> bool {
     false
 }
 
+/// 128 bits of `mask` starting at bit `pos` (bits past the data are zero:
+/// `build` leaves a zero word after the last one, and callers mask to the
+/// line length).
+#[inline(always)]
+fn window128(mask: &[u64], pos: usize) -> u128 {
+    let w = pos >> 6;
+    let sh = (pos & 63) as u32;
+    let a = unsafe { *mask.get_unchecked(w) } as u128;
+    let b = unsafe { *mask.get_unchecked(w + 1) } as u128;
+    let c = if w + 2 < mask.len() {
+        unsafe { *mask.get_unchecked(w + 2) as u128 }
+    } else {
+        0
+    };
+    let lo = (a | (b << 64)) >> sh;
+    if sh == 0 {
+        lo
+    } else {
+        lo | (c << (128 - sh))
+    }
+}
+
 /// Calls `f(fields)` for every line that starts in `b[..limit]` (after the
 /// partial first line unless `first`) and splits into exactly N fields under
 /// the `split_fields_csv` dialect. Lines that do not split are skipped, as the
@@ -145,22 +169,60 @@ pub fn for_each_record<const N: usize>(
     let nl = &masks.nl;
     let comma = &masks.comma;
     let quote = &masks.quote;
-    let mut nl_it = bits_in(nl, 0, b.len());
+    let nwords = b.len().div_ceil(64);
+    // newline cursor
+    let mut w = 0usize;
+    let mut cur = if nwords > 0 { nl[0] } else { 0 };
+    let mut next_nl = || -> usize {
+        loop {
+            if cur != 0 {
+                let t = cur.trailing_zeros() as usize;
+                cur &= cur - 1;
+                return (w << 6) + t;
+            }
+            w += 1;
+            if w >= nwords {
+                return usize::MAX;
+            }
+            cur = unsafe { *nl.get_unchecked(w) };
+        }
+    };
     let mut pos = if first {
         0
     } else {
-        match nl_it.next() {
-            Some(p) => p + 1,
-            None => return,
+        match next_nl() {
+            usize::MAX => return,
+            p => p + 1,
         }
     };
     while pos < limit && pos < b.len() {
-        let end = match nl_it.next() {
-            Some(p) => p,
-            None => b.len(),
+        let end = match next_nl() {
+            usize::MAX => b.len(),
+            p => p,
         };
-        let line = &b[pos..end];
-        if any_in(quote, pos, end) {
+        let len = end - pos;
+        let line = unsafe { b.get_unchecked(pos..end) };
+        if len < 128 {
+            let lmask: u128 = (1u128 << len) - 1;
+            let q = window128(quote, pos) & lmask;
+            if q == 0 {
+                let mut c = window128(comma, pos) & lmask;
+                if c.count_ones() as usize == N - 1 {
+                    let mut fields: [&[u8]; N] = [&[]; N];
+                    let mut s = 0usize;
+                    for fi in fields.iter_mut().take(N - 1) {
+                        let p = c.trailing_zeros() as usize;
+                        c &= c - 1;
+                        *fi = unsafe { line.get_unchecked(s..p) };
+                        s = p + 1;
+                    }
+                    fields[N - 1] = unsafe { line.get_unchecked(s..) };
+                    f(&fields);
+                }
+            } else if let Some(fields) = split_fields_csv::<N>(line) {
+                f(&fields);
+            }
+        } else if any_in(quote, pos, end) {
             if let Some(fields) = split_fields_csv::<N>(line) {
                 f(&fields);
             }
@@ -169,7 +231,7 @@ pub fn for_each_record<const N: usize>(
             let mut cnt = 0usize;
             for c in bits_in(comma, pos, end) {
                 if cnt >= N - 1 {
-                    cnt = N; // too many commas
+                    cnt = N;
                     break;
                 }
                 cpos[cnt] = c;
@@ -233,6 +295,10 @@ mod tests {
             text.extend_from_slice(l);
             if i % 7 == 3 {
                 text.extend_from_slice(b"padpadpadpadpadpadpadpadpadpadpadpadpadpadpad");
+            }
+            if i % 11 == 5 {
+                // push the line past 128 bytes
+                text.extend_from_slice(&[b'z'; 100]);
             }
             text.push(b'\n');
         }

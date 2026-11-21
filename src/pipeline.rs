@@ -33,7 +33,7 @@ use crate::parquet_out::{
 use crate::sso::SmallBytes;
 use crate::timestamp::parse_ts_padded;
 
-const S1_BITS: u32 = 9; // event-id dedup shards
+const S1_BITS: u32 = 10; // event-id dedup shards
 const S1: usize = 1 << S1_BITS;
 const P_BITS: u32 = 8; // person partitions
 const NP: usize = 1 << P_BITS;
@@ -1101,16 +1101,15 @@ pub fn run_pipeline(
     let evb = &ev_blocks;
     struct P2 {
         out: Scatter<PRec>,
-        keys: Vec<u64>,
-        ptrs: Vec<usize>,
+        // interleaved [key, record address] slots; key 0 = empty
+        tab: Vec<[u64; 2]>,
     }
     let p2_states = par_tasks(
         S1,
         threads,
         |_| P2 {
             out: Scatter::new(NP),
-            keys: Vec::new(),
-            ptrs: Vec::new(),
+            tab: Vec::new(),
         },
         |st, s| {
             let n: usize = evb
@@ -1121,15 +1120,13 @@ pub fn run_pipeline(
                 return;
             }
             let cap = (n * 2).next_power_of_two().max(64);
-            if st.keys.len() < cap {
-                st.keys = vec![0u64; cap];
-                st.ptrs = vec![0usize; cap];
+            if st.tab.len() < cap {
+                st.tab = vec![[0u64; 2]; cap];
             } else {
-                st.keys[..cap].fill(0);
+                st.tab[..cap].fill([0, 0]);
             }
             let mask = cap - 1;
-            let keys = &mut st.keys[..cap];
-            let ptrs = &mut st.ptrs[..cap];
+            let tab = &mut st.tab[..cap];
             for w in evb.iter() {
                 for b in w[s].iter() {
                     let recs = b.as_slice();
@@ -1139,28 +1136,24 @@ pub fn run_pipeline(
                             let slot = (mix64(nx.key) as usize) & mask;
                             unsafe {
                                 core::arch::x86_64::_mm_prefetch(
-                                    keys.as_ptr().add(slot) as *const i8,
+                                    tab.as_ptr().add(slot) as *const i8,
                                     core::arch::x86_64::_MM_HINT_T0,
                                 );
                             }
                         }
                         let k = r.key;
+                        let addr = r as *const EvRec as u64;
                         let mut j = (mix64(k) as usize) & mask;
                         loop {
-                            let kk = unsafe { *keys.get_unchecked(j) };
-                            if kk == 0 {
-                                unsafe {
-                                    *keys.get_unchecked_mut(j) = k;
-                                    *ptrs.get_unchecked_mut(j) = r as *const EvRec as usize;
-                                }
+                            let e = unsafe { tab.get_unchecked_mut(j) };
+                            if e[0] == 0 {
+                                *e = [k, addr];
                                 break;
                             }
-                            if kk == k {
-                                let cur = unsafe { &*(*ptrs.get_unchecked(j) as *const EvRec) };
+                            if e[0] == k {
+                                let cur = unsafe { &*(e[1] as *const EvRec) };
                                 if r.ingest < cur.ingest {
-                                    unsafe {
-                                        *ptrs.get_unchecked_mut(j) = r as *const EvRec as usize
-                                    };
+                                    e[1] = addr;
                                 }
                                 break;
                             }
@@ -1179,10 +1172,10 @@ pub fn run_pipeline(
                         }
                         let k = r.key;
                         let mut j = (mix64(k) as usize) & mask;
-                        while unsafe { *keys.get_unchecked(j) } != k {
+                        while unsafe { tab.get_unchecked(j)[0] } != k {
                             j = (j + 1) & mask;
                         }
-                        if unsafe { *ptrs.get_unchecked(j) } == r as *const EvRec as usize {
+                        if unsafe { tab.get_unchecked(j)[1] } == r as *const EvRec as u64 {
                             let canon = dsu_r.resolve(r.user);
                             st.out.push(
                                 arena_ref,
