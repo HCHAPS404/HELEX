@@ -40,5 +40,9 @@ pub fn should_spill_events(total_event_csv_bytes: u64) -> bool {
         return true;
     }
     let mem_limit = detect_memory_limit_bytes();
+    // Resident cost ~= 3.3x CSV bytes (48B records + survivors + person
+    // tables + mapped input pages). mem_limit/2 keeps ~2x headroom: at 24 GiB
+    // the spill triggers only above ~12 GiB of CSV (~176M events), so the
+    // 20M/60M workloads stay fully resident.
     total_event_csv_bytes > mem_limit / 2
 }

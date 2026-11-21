@@ -22,7 +22,7 @@ app = modal.App("helex-bench")
 
 _base = (
     modal.Image.from_registry("rust:1.90-slim-bookworm", add_python="3.12")
-    .apt_install("python3-pip")
+    .apt_install("python3-pip", "time")
     .pip_install("duckdb==1.5.6")
 )
 
@@ -94,7 +94,7 @@ def bench(seed: int, events: int, clicks: int) -> dict:
 
     t1 = time.perf_counter()
     proc = subprocess.Popen(
-        ["shopping-sessions"], env=env,
+        ["/usr/bin/time", "-v", "shopping-sessions"], env=env,
         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
     )
     th = threading.Thread(target=poll_mem)
@@ -103,11 +103,37 @@ def bench(seed: int, events: int, clicks: int) -> dict:
     th.join()
     run_s = time.perf_counter() - t1
 
+    # I/O floor probe: drop cache again, then sequentially read events CSVs
+    # to measure the node's raw disk floor for the input volume.
+    for root, _, files in os.walk("/data"):
+        for fn in files:
+            try:
+                fd = os.open(os.path.join(root, fn), os.O_RDONLY)
+                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                os.close(fd)
+            except OSError:
+                pass
+    ev_files = [
+        os.path.join(root, fn)
+        for root, _, files in os.walk(os.path.join(data, "events"))
+        for fn in files
+    ]
+    ev_bytes = 0
+    t2 = time.perf_counter()
+    for f in ev_files:
+        with open(f, "rb", buffering=0) as fh:
+            while fh.read(8 << 20):
+                pass
+        ev_bytes += os.path.getsize(f)
+    io_floor = time.perf_counter() - t2
+
     result = {
         "seed": seed, "events": events, "gen_s": round(gen_s, 2),
         "run_s": round(run_s, 3), "rc": proc.returncode,
+        "io_floor_s": round(io_floor, 3),
+        "events_mb": round(ev_bytes / 2**20, 1),
         "peak_rss_mib": round(peak[0] / 2**20, 1),
-        "stderr_tail": stderr.decode(errors="replace")[-1500:],
+        "stderr_tail": stderr.decode(errors="replace")[-4000:],
     }
     if proc.returncode == 0:
         import duckdb

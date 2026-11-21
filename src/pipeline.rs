@@ -245,11 +245,14 @@ fn dedup_one_shard(
     dsu: &UnionFind,
     tab: &mut DedupTab,
     parts: &mut Vec<Vec<Survivor>>,
+    ins_nanos: &std::sync::atomic::AtomicU64,
+    emit_nanos: &std::sync::atomic::AtomicU64,
 ) {
     let est: usize = bufs.iter().map(|b| b.recs.len()).sum();
     tab.reset(est);
     let mut tmp_a = [0u8; 9];
     let mut tmp_b = [0u8; 9];
+    let t_ins = std::time::Instant::now();
     for (buf_idx, sb) in bufs.iter().enumerate() {
         for (rec_idx, rec) in sb.recs.iter().enumerate() {
             let key = rec.key;
@@ -287,6 +290,11 @@ fn dedup_one_shard(
             }
         }
     }
+    let t_emit = std::time::Instant::now();
+    ins_nanos.fetch_add(
+        (t_emit - t_ins).as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
 
     for &v in tab.vals.iter() {
         if v == EMPTY_LOC {
@@ -307,6 +315,10 @@ fn dedup_one_shard(
             ev: rec.ev,
         });
     }
+    emit_nanos.fetch_add(
+        t_emit.elapsed().as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 struct PersonTable {
@@ -601,8 +613,11 @@ pub fn run_pipeline(
 
     // DSU build (links ingest + union) overlaps the events shard ingest:
     // canonicalization is only needed at dedup emission, not during parse.
-    let (dsu, shard_inputs) = std::thread::scope(|scope| -> io::Result<_> {
-        let dsu_handle = scope.spawn(|| crate::dsu::load_links(data_dir, threads));
+    let (dsu, shard_inputs, t_ingest, t_dsu_wall) = std::thread::scope(|scope| -> io::Result<_> {
+        let dsu_handle = scope.spawn(|| {
+            let tt = std::time::Instant::now();
+            (crate::dsu::load_links(data_dir, threads), tt)
+        });
         let inputs: Vec<Vec<ShardBuf>> = if !spill {
         let block_sz = if total_event_bytes >= (64 << 20) {
             4 << 20
@@ -793,20 +808,27 @@ pub fn run_pipeline(
         let _ = fs::remove_dir_all(&spill_dir);
         flat
         };
-        let dsu = dsu_handle.join().unwrap()?;
-        Ok((dsu, inputs))
+        let t_ingest = t1.elapsed();
+        let (dsu_res, t_dsu_start) = dsu_handle.join().unwrap();
+        Ok((dsu_res?, inputs, t_ingest, t_dsu_start.elapsed()))
     })?;
     let dsu_ref = &dsu;
-    let t_dsu = std::time::Duration::ZERO;
     let t2 = t1;
+    let ins_nanos = std::sync::atomic::AtomicU64::new(0);
+    let emit_nanos = std::sync::atomic::AtomicU64::new(0);
+    let mut t_clicks_wall = std::time::Duration::ZERO;
 
     // Dedup (CPU/RAM-bound) and click CSV ingest (I/O+parse-bound) overlap:
     // dedup runs on a scoped worker while clicks stream through the pool.
     let shard_inputs_ref = &shard_inputs;
+    let ins_ref = &ins_nanos;
+    let emit_ref = &emit_nanos;
     let mut click_parts_res: Option<io::Result<Vec<Vec<Vec<ClickCand>>>>> = None;
     let click_min_ts = catalog.window_start - CLICK_REACH_MS;
-    let survivors: Vec<Vec<Vec<Survivor>>> = std::thread::scope(|scope| {
+    let (survivors, t_dedup_wall): (Vec<Vec<Vec<Survivor>>>, _) =
+        std::thread::scope(|scope| {
         let dedup_handle = scope.spawn(|| {
+            let td = std::time::Instant::now();
             let surv_slots: Vec<Mutex<Option<Vec<Vec<Survivor>>>>> = (0..NUM_SHARDS)
                 .map(|_| Mutex::new(None))
                 .collect();
@@ -823,15 +845,24 @@ pub fn run_pipeline(
                 let mut parts: Vec<Vec<Survivor>> =
                     (0..NUM_SHARDS).map(|_| Vec::new()).collect();
                 DEDUP_TAB.with(|t| {
-                    dedup_one_shard(bufs, dsu_ref, &mut t.borrow_mut(), &mut parts)
+                    dedup_one_shard(
+                        bufs,
+                        dsu_ref,
+                        &mut t.borrow_mut(),
+                        &mut parts,
+                        ins_ref,
+                        emit_ref,
+                    )
                 });
                 *surv_slots_ref[s].lock().unwrap() = Some(parts);
             });
-            surv_slots
+            let collected = surv_slots
                 .into_iter()
                 .map(|m| m.into_inner().unwrap().unwrap_or_default())
-                .collect::<Vec<Vec<Vec<Survivor>>>>()
+                .collect::<Vec<Vec<Vec<Survivor>>>>();
+            (collected, td.elapsed())
         });
+        let tc = std::time::Instant::now();
         click_parts_res = Some((|| -> io::Result<Vec<Vec<Vec<ClickCand>>>> {
         let click_paths = csv_paths(&data_dir.join("clicks"));
         let total_click_bytes: u64 = click_paths
@@ -890,12 +921,12 @@ pub fn run_pipeline(
             }
             Ok(flat)
         })());
+        t_clicks_wall = tc.elapsed();
         dedup_handle.join().unwrap()
     });
     drop(shard_inputs);
     let t_events = t2.elapsed();
     let click_parts = click_parts_res.unwrap()?;
-    let t_clicks = std::time::Duration::ZERO;
 
     let t4 = std::time::Instant::now();
     let part_slots: Vec<Mutex<Option<PartResult>>> =
@@ -1007,22 +1038,36 @@ pub fn run_pipeline(
     write_campaign_daily(out_dir, &camp_rows)?;
     let t_parquet = t5.elapsed();
 
-    if debug_bench {
-        eprintln!(
-            "[DEBUG_BENCH] threads={} spill={} cat={:.3}s dsu={:.3}s events={:.3}s clicks={:.3}s sess={:.3}s parquet={:.3}s total={:.3}s (user_rows={}, camp_rows={})",
-            threads,
-            spill,
-            t_cat.as_secs_f64(),
-            t_dsu.as_secs_f64(),
-            t_events.as_secs_f64(),
-            t_clicks.as_secs_f64(),
-            t_sess.as_secs_f64(),
-            t_parquet.as_secs_f64(),
-            t0.elapsed().as_secs_f64(),
-            total_user_rows,
-            camp_rows.len()
-        );
-    }
+    let avx2: u8 = {
+        #[cfg(target_arch = "x86_64")]
+        {
+            std::arch::is_x86_feature_detected!("avx2") as u8
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            0
+        }
+    };
+    let _ = debug_bench;
+    eprintln!(
+        "[bench] threads={} avx2={} spill={} cat={:.3}s dsu={:.3}s ingest={:.3}s dedup={:.3}s ins_cpu={:.3}s emit_cpu={:.3}s clicks={:.3}s events={:.3}s sess={:.3}s parquet={:.3}s total={:.3}s user_rows={} camp_rows={}",
+        threads,
+        avx2,
+        spill,
+        t_cat.as_secs_f64(),
+        t_dsu_wall.as_secs_f64(),
+        t_ingest.as_secs_f64(),
+        t_dedup_wall.as_secs_f64(),
+        ins_nanos.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9,
+        emit_nanos.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9,
+        t_clicks_wall.as_secs_f64(),
+        t_events.as_secs_f64(),
+        t_sess.as_secs_f64(),
+        t_parquet.as_secs_f64(),
+        t0.elapsed().as_secs_f64(),
+        total_user_rows,
+        camp_rows.len()
+    );
     std::mem::forget(all_part_results);
     Ok(())
 }
