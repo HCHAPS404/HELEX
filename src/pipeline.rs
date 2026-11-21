@@ -17,6 +17,7 @@ use crate::sso::{hash64_bytes, SmallBytes};
 use crate::timestamp::{parse_f1_fast, parse_timestamp};
 
 const NUM_SHARDS: usize = 256;
+const SHARD_SHIFT: u32 = 64 - NUM_SHARDS.trailing_zeros();
 const DAY_MS: i64 = 86_400_000;
 const LATE_LIMIT_MS: i64 = 86_400_000;
 const SESSION_GAP_MS: i64 = 1_800_000;
@@ -374,7 +375,7 @@ fn dedup_insert_mark(
 }
 
 // Phase E: sequential scan over winner bits -> linkmap probe -> 16B
-// (canon_key | ev) records into canon partitions (part = canon_key >> 56).
+// (canon_key | ev) records into canon partitions (part = canon_key >> SHARD_SHIFT).
 // A linkmap miss means the user is unlinked: canon_key = own user key.
 fn emit_shard(
     bufs: &[ShardBuf],
@@ -401,21 +402,21 @@ fn emit_shard(
                 let rec = &sb.recs[r];
                 let uk = rec.user_key;
                 let ck = if rec.user_loc == u32::MAX && uk != 0 {
-                    link_maps[(uk >> 56) as usize].get(uk).unwrap_or(uk)
+                    link_maps[(uk >> SHARD_SHIFT) as usize].get(uk).unwrap_or(uk)
                 } else {
                     let bytes =
                         key_bytes(uk, b'u', &sb.side, rec.user_loc, &mut tmp_a);
                     let canon = dsu.resolve(bytes);
                     let (ck, cslow) = field_key(canon, b'u');
                     if cslow || ck == 0 {
-                        side_emit[(ck >> 56) as usize]
+                        side_emit[(ck >> SHARD_SHIFT) as usize]
                             .lock()
                             .unwrap()
                             .push((ck, SmallBytes::from_slice(canon)));
                     }
                     ck
                 };
-                let part = (ck >> 56) as usize;
+                let part = (ck >> SHARD_SHIFT) as usize;
                 stage[part][stage_n[part] as usize] = Rec16 {
                     canon_key: ck,
                     ev: rec.ev,
@@ -520,11 +521,11 @@ fn build_link_maps(
                 let (uk, uslow) = field_key(raw, b'u');
                 let (ck, cslow) = field_key(canon, b'u');
                 if cslow || ck == 0 {
-                    ls[(ck >> 56) as usize]
+                    ls[(ck >> SHARD_SHIFT) as usize]
                         .push((ck, SmallBytes::from_slice(canon)));
                 }
                 if !uslow && uk != 0 {
-                    lp[(uk >> 56) as usize].push((uk, ck));
+                    lp[(uk >> SHARD_SHIFT) as usize].push((uk, ck));
                 }
             }
             for s in 0..NUM_SHARDS {
@@ -926,7 +927,7 @@ pub fn run_pipeline(
                     std::hint::black_box(&(key, slow_id, ingest_ms));
                     return;
                 }
-                let s_idx = (mix64(key) >> 56) as usize;
+                let s_idx = (mix64(key) >> SHARD_SHIFT) as usize;
                 let id_loc = if slow_id {
                     sc.shards[s_idx].put_side(event_id)
                 } else {
@@ -1006,7 +1007,7 @@ pub fn run_pipeline(
                     return;
                 };
                 let (key, slow_id) = field_key(event_id, b'e');
-                let shard = (mix64(key) >> 56) as usize;
+                let shard = (mix64(key) >> SHARD_SHIFT) as usize;
                 let id_loc = if slow_id {
                     tmp.put_side(event_id)
                 } else {
@@ -1235,11 +1236,11 @@ pub fn run_pipeline(
                 // through the DSU like emit's slow path.
                 let (uk, uslow) = field_key(user_raw, b'u');
                 let ck = if !uslow && uk != 0 {
-                    link_maps_ref[(uk >> 56) as usize].get(uk).unwrap_or(uk)
+                    link_maps_ref[(uk >> SHARD_SHIFT) as usize].get(uk).unwrap_or(uk)
                 } else {
                     field_key(dsu_ref.resolve(user_raw), b'u').0
                 };
-                parts[(ck >> 56) as usize].push(ClickRec {
+                parts[(ck >> SHARD_SHIFT) as usize].push(ClickRec {
                     canon_key: ck,
                     ts,
                     click_id: SmallBytes::from_slice(click_id),
