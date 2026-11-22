@@ -459,6 +459,10 @@ struct UEnt {
 const UDIRTY: u64 = 1 << 63;
 const UALIAS_MAX: u64 = 63;
 
+// utab is capped: user indexes past the bound resolve per row instead of
+// ballooning the table (a mis-recovered key could otherwise ask for GBs).
+const UTAB_CAP: usize = 1 << 25;
+
 #[inline]
 fn dense_canon(
     v: u64,
@@ -469,7 +473,15 @@ fn dense_canon(
 ) -> u64 {
     let a = v & counters::ALIAS_MASK;
     let u = (v >> counters::ALIAS_BITS) as usize;
-    let e = utab.get(u).copied().unwrap_or_default();
+    // utab never exceeds UTAB_CAP entries: indexes beyond it resolve
+    // exactly, indexes inside it with no sides are clean self-canonicals.
+    let e = if u < utab.len() {
+        utab[u]
+    } else if u < UTAB_CAP {
+        UEnt::default()
+    } else {
+        UEnt { canon: 0, mask: UDIRTY }
+    };
     if a < UALIAS_MAX && (e.mask >> a) & 1 == 1 {
         return e.canon;
     }
@@ -728,6 +740,10 @@ fn build_utab(mut vs: Vec<(u64, u64, bool)>) -> Vec<UEnt> {
                 mask |= UDIRTY;
             }
             j += 1;
+        }
+        if u >= UTAB_CAP {
+            i = j;
+            continue;
         }
         if utab.len() <= u {
             utab.resize(u + 1, UEnt::default());
