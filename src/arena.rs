@@ -162,3 +162,89 @@ impl<T: Copy> Scatter<T> {
         std::mem::take(&mut self.done)
     }
 }
+
+/// Scatter with per-partition staging and non-temporal block writes: K
+/// records are gathered in a small cache-resident buffer, then written to the
+/// block as whole cache lines with streaming stores (no read-for-ownership of
+/// the destination lines). `K * size_of::<T>()` must be a multiple of 64.
+pub struct StageScatter<T: Copy, const K: usize> {
+    inner: Scatter<T>,
+    stage: Vec<[T; K]>,
+    stage_n: Vec<u8>,
+}
+unsafe impl<T: Copy, const K: usize> Send for StageScatter<T, K> {}
+
+impl<T: Copy, const K: usize> StageScatter<T, K> {
+    const CAPK: u32 = (Scatter::<T>::CAP / K as u32) * K as u32;
+
+    pub fn new(parts: usize, zero: T) -> Self {
+        assert!((K * std::mem::size_of::<T>()) % 64 == 0);
+        Self {
+            inner: Scatter::new(parts),
+            stage: vec![[zero; K]; parts],
+            stage_n: vec![0; parts],
+        }
+    }
+
+    #[inline(always)]
+    pub fn push(&mut self, arena: &Arena, part: usize, rec: T) {
+        unsafe {
+            let n = *self.stage_n.get_unchecked(part) as usize;
+            *self.stage.get_unchecked_mut(part).get_unchecked_mut(n) = rec;
+            if n + 1 < K {
+                *self.stage_n.get_unchecked_mut(part) = (n + 1) as u8;
+            } else {
+                *self.stage_n.get_unchecked_mut(part) = 0;
+                self.flush_full(arena, part);
+            }
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn flush_full(&mut self, arena: &Arena, part: usize) {
+        let fill = *self.inner.fill.get_unchecked(part);
+        if fill + K as u32 > Self::CAPK {
+            self.inner.roll(arena, part);
+        }
+        let fill = *self.inner.fill.get_unchecked(part);
+        let dst = self.inner.cur.get_unchecked(part).add(fill as usize) as *mut u8;
+        let src = self.stage.get_unchecked(part).as_ptr() as *const u8;
+        stream_copy(dst, src, K * std::mem::size_of::<T>());
+        *self.inner.fill.get_unchecked_mut(part) = fill + K as u32;
+    }
+
+    pub fn finish(mut self, arena: &Arena) -> Vec<Vec<Blk<T>>> {
+        for part in 0..self.stage_n.len() {
+            let n = self.stage_n[part] as usize;
+            for i in 0..n {
+                let r = self.stage[part][i];
+                self.inner.push(arena, part, r);
+            }
+        }
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            core::arch::x86_64::_mm_sfence();
+        }
+        self.inner.finish(arena)
+    }
+}
+
+/// Copies `len` bytes (multiple of 64; `dst` 32-byte aligned) with streaming
+/// stores when AVX is available.
+#[inline(always)]
+unsafe fn stream_copy(dst: *mut u8, src: *const u8, len: usize) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx"))]
+    {
+        use std::arch::x86_64::*;
+        let mut o = 0;
+        while o < len {
+            let v = _mm256_loadu_si256(src.add(o) as *const __m256i);
+            _mm256_stream_si256(dst.add(o) as *mut __m256i, v);
+            o += 32;
+        }
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx")))]
+    {
+        std::ptr::copy_nonoverlapping(src, dst, len);
+    }
+}

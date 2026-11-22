@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicUsize, Ordering as AtOrd};
 use std::sync::Mutex;
 use std::time::Instant;
 
-use crate::arena::{Arena, Blk, Scatter};
+use crate::arena::{Arena, Blk, Scatter, StageScatter};
 use crate::catalog::Catalog;
 use crate::csv_dialect::parse_price_cents;
 use crate::csv_scan::{for_each_record, Masks};
@@ -516,10 +516,10 @@ where
 struct P1 {
     worker: usize,
     bits: Bits,
-    ev: Scatter<Ev24>,
+    ev: StageScatter<Ev24, 8>,
     wide: Vec<EvRec>,
     slow_seen: KeyMap,
-    ck: Scatter<CkRec>,
+    ck: StageScatter<CkRec, 8>,
     slow_u: Vec<(u64, Box<[u8]>)>,
     long_cids: Vec<Box<[u8]>>,
     ck_pend: Vec<CkRec>,
@@ -1340,10 +1340,10 @@ pub fn run_pipeline(
             |w| P1 {
                 worker: w,
                 bits,
-                ev: Scatter::new(1 << bits.s1),
+                ev: StageScatter::new(1 << bits.s1, Ev24 { key: 0, user: 0, w: 0 }),
                 wide: Vec::new(),
                 slow_seen: KeyMap::with_capacity(16),
-                ck: Scatter::new(1 << bits.p),
+                ck: StageScatter::new(1 << bits.p, CkRec { canon: 0, cid: 0, ts: 0, camp: 0, form: 0 }),
                 slow_u: Vec::new(),
                 long_cids: Vec::new(),
                 ck_pend: Vec::with_capacity(CK_BATCH),
