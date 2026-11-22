@@ -94,6 +94,25 @@ pub unsafe fn id_key_padded(f: &[u8], prefix: u8) -> (u64, bool) {
     (slow_key(f), true)
 }
 
+/// Big-endian, zero-padded (hi, lo) words of a field of <= 16 bytes, using
+/// wide loads (no byte copies).
+///
+/// # Safety
+/// 16 bytes from `f.as_ptr()` must be readable (padded buffer).
+#[inline(always)]
+pub unsafe fn be16_padded(f: &[u8]) -> (u64, u64) {
+    let n = f.len();
+    debug_assert!(n <= 16);
+    let p = f.as_ptr();
+    let hi = load_le_n(p, n.min(8)).swap_bytes();
+    let lo = if n > 8 {
+        load_le_n(p.add(8), n - 8).swap_bytes()
+    } else {
+        0
+    };
+    (hi, lo)
+}
+
 #[inline]
 pub fn slow_key(f: &[u8]) -> u64 {
     SLOW_TOP | (hash64_bytes(f) & LOW56)
@@ -169,6 +188,24 @@ impl KeyMap {
         (mix64(k) as usize) & self.mask
     }
 
+    #[inline(always)]
+    pub fn prefetch(&self, k: u64) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            let i = self.slot(k);
+            core::arch::x86_64::_mm_prefetch(
+                self.keys.as_ptr().add(i) as *const i8,
+                core::arch::x86_64::_MM_HINT_T0,
+            );
+            core::arch::x86_64::_mm_prefetch(
+                self.vals.as_ptr().add(i) as *const i8,
+                core::arch::x86_64::_MM_HINT_T0,
+            );
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = k;
+    }
+
     #[inline]
     pub fn get(&self, k: u64) -> Option<u32> {
         let mut i = self.slot(k);
@@ -201,27 +238,6 @@ impl KeyMap {
                 self.vals[i] = v;
                 self.len += 1;
                 return (v, true);
-            }
-            i = (i + 1) & self.mask;
-        }
-    }
-
-    pub fn insert(&mut self, k: u64, v: u32) {
-        if (self.len + 1) * 2 > self.keys.len() {
-            self.grow();
-        }
-        let mut i = self.slot(k);
-        loop {
-            let kk = self.keys[i];
-            if kk == k {
-                self.vals[i] = v;
-                return;
-            }
-            if kk == 0 {
-                self.keys[i] = k;
-                self.vals[i] = v;
-                self.len += 1;
-                return;
             }
             i = (i + 1) & self.mask;
         }

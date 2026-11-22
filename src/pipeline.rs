@@ -25,7 +25,7 @@ use crate::catalog::Catalog;
 use crate::csv_dialect::parse_price_cents;
 use crate::csv_scan::{for_each_record, Masks};
 use crate::dsu::{csv_paths, load_links, Dsu};
-use crate::keys::{fast_key_bytes, id_key, id_key_padded, is_slow, mix64, shard_of, KeyMap};
+use crate::keys::{be16_padded, fast_key_bytes, id_key, id_key_padded, is_slow, mix64, shard_of, KeyMap};
 use crate::parquet_out::{
     write_campaign_daily, write_user_daily_part, CampaignDailyRow, UserDailyRow, UserDailyWriter,
     BATCH_ROWS,
@@ -409,6 +409,7 @@ struct P1 {
     slow_e: Vec<(u64, Box<[u8]>)>,
     slow_u: Vec<(u64, Box<[u8]>)>,
     long_cids: Vec<Box<[u8]>>,
+    ck_pend: Vec<CkRec>,
     buf: Vec<u8>,
     masks: Masks,
     err: Option<io::Error>,
@@ -881,31 +882,36 @@ fn parse_click_line(
     if slow_u {
         st.slow_u.push((uk, user_raw.into()));
     }
-    let canon = dsu.resolve(uk);
     let (cid_hi, cid_lo, long) = if click_id.len() <= 16 && memchr::memchr(0, click_id).is_none() {
-        let mut b = [0u8; 16];
-        b[..click_id.len()].copy_from_slice(click_id);
-        (
-            u64::from_be_bytes(b[..8].try_into().unwrap()),
-            u64::from_be_bytes(b[8..].try_into().unwrap()),
-            0u32,
-        )
+        let (hi, lo) = unsafe { be16_padded(click_id) };
+        (hi, lo, 0u32)
     } else {
         st.long_cids.push(click_id.into());
         (st.worker as u64, (st.long_cids.len() - 1) as u64, 1u32)
     };
-    st.ck.push(
-        arena,
-        shard_of(canon, st.bits.p),
-        CkRec {
-            canon,
-            ts,
-            cid_hi,
-            cid_lo,
-            camp: u32::from(camp),
-            long,
-        },
-    );
+    // Linked-ID resolution is a DRAM-latency lookup: queue the click, issue
+    // a prefetch, and resolve in batches.
+    dsu.prefetch(uk);
+    st.ck_pend.push(CkRec {
+        canon: uk,
+        ts,
+        cid_hi,
+        cid_lo,
+        camp: u32::from(camp),
+        long,
+    });
+    if st.ck_pend.len() >= CK_BATCH {
+        flush_clicks(st, dsu, arena);
+    }
+}
+
+const CK_BATCH: usize = 16;
+
+fn flush_clicks(st: &mut P1, dsu: &Dsu, arena: &Arena) {
+    for mut c in st.ck_pend.drain(..) {
+        c.canon = dsu.resolve(c.canon);
+        st.ck.push(arena, shard_of(c.canon, st.bits.p), c);
+    }
 }
 
 // ------------------------------------------------------------------- driver
@@ -1028,6 +1034,7 @@ pub fn run_pipeline(
                 slow_e: Vec::new(),
                 slow_u: Vec::new(),
                 long_cids: Vec::new(),
+                ck_pend: Vec::with_capacity(CK_BATCH),
                 buf: Vec::with_capacity((chunk + TAIL) as usize + PAD),
                 masks: Masks::default(),
                 err: None,
@@ -1054,19 +1061,23 @@ pub fn run_pipeline(
                             std::thread::yield_now();
                         };
                         match dsu {
-                            Ok(dsu) => run_chunk(f, task.start, task.end, &mut buf, |b, first, limit| {
-                                for_each_record::<4>(b, first, limit, &mut masks, |fields| {
-                                    parse_click_line(
-                                        st,
-                                        fields,
-                                        pctx_ref,
-                                        dsu,
-                                        arena_ref,
-                                        click_min_ts,
-                                        we,
-                                    )
-                                })
-                            }),
+                            Ok(dsu) => {
+                                let r = run_chunk(f, task.start, task.end, &mut buf, |b, first, limit| {
+                                    for_each_record::<4>(b, first, limit, &mut masks, |fields| {
+                                        parse_click_line(
+                                            st,
+                                            fields,
+                                            pctx_ref,
+                                            dsu,
+                                            arena_ref,
+                                            click_min_ts,
+                                            we,
+                                        )
+                                    })
+                                });
+                                flush_clicks(st, dsu, arena_ref);
+                                r
+                            }
                             Err(_) => Ok(()),
                         }
                     }
@@ -1194,7 +1205,13 @@ pub fn run_pipeline(
             // cache-resident), instead of random record reads from the table.
             for w in evb.iter() {
                 for b in w[s].iter() {
-                    for r in b.as_slice() {
+                    let recs = b.as_slice();
+                    for (i, r) in recs.iter().enumerate() {
+                        if let Some(nx) = recs.get(i + 12) {
+                            if nx.user != 0 {
+                                dsu_r.prefetch(nx.user);
+                            }
+                        }
                         if r.user == 0 {
                             continue;
                         }

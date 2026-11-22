@@ -203,11 +203,19 @@ pub fn for_each_record<const N: usize>(
         let len = end - pos;
         let line = unsafe { b.get_unchecked(pos..end) };
         if len < 128 {
+            // Same dialect as `split_fields_csv`: exactly N-1 commas, every
+            // quote adjacent to a comma or a line edge, and quoted fields
+            // both open and close with a quote (stripped).
             let lmask: u128 = (1u128 << len) - 1;
-            let q = window128(quote, pos) & lmask;
-            if q == 0 {
-                let mut c = window128(comma, pos) & lmask;
-                if c.count_ones() as usize == N - 1 {
+            let mut c = window128(comma, pos) & lmask;
+            if c.count_ones() as usize == N - 1 {
+                let q = window128(quote, pos) & lmask;
+                let ok = q == 0 || {
+                    let left_ok = (c << 1) | 1;
+                    let right_ok = (c >> 1) | (1u128 << (len - 1));
+                    q & !(left_ok | right_ok) == 0
+                };
+                if ok {
                     let mut fields: [&[u8]; N] = [&[]; N];
                     let mut s = 0usize;
                     for fi in fields.iter_mut().take(N - 1) {
@@ -217,10 +225,25 @@ pub fn for_each_record<const N: usize>(
                         s = p + 1;
                     }
                     fields[N - 1] = unsafe { line.get_unchecked(s..) };
-                    f(&fields);
+                    let mut good = true;
+                    if q != 0 {
+                        for fi in fields.iter_mut() {
+                            let fl = fi.len();
+                            let lead = fl > 0 && fi[0] == b'"';
+                            let tail = fl > 0 && fi[fl - 1] == b'"';
+                            if lead != tail || (lead && fl < 2) {
+                                good = false;
+                                break;
+                            }
+                            if lead {
+                                *fi = unsafe { fi.get_unchecked(1..fl - 1) };
+                            }
+                        }
+                    }
+                    if good {
+                        f(&fields);
+                    }
                 }
-            } else if let Some(fields) = split_fields_csv::<N>(line) {
-                f(&fields);
             }
         } else if any_in(quote, pos, end) {
             if let Some(fields) = split_fields_csv::<N>(line) {
@@ -290,6 +313,16 @@ mod tests {
             b"\"\",\"\",\"\",\"\",\"\",\"\",\"\"",
             b"x,y,z,w,v,u,t,s,r,q,p,o,n,m,l,k,j,i,h,g,f,e,d,c,b,a,aa,bb,cc,dd,ee,ff,gg,hh",
             b"short,1,2,3,4,5,6",
+            b"\"e1\",\"u1\",\"t\",\"i\",\"view\",\"p1\",\"5\"",
+            b"\"e1,u1,t,i,view,p1,5",
+            b"e1\",u1,t,i,view,p1,5",
+            b"\",u1,t,i,view,p1,5",
+            b"\"\",u1,t,i,view,p1,\"\"",
+            b"e\"1,u1,t,i,view,p1,5",
+            b"\"e1\"x,u1,t,i,view,p1,5",
+            b"e1,u1,t,i,view,p1,\"",
+            b"e1,u1,t,i,view,p1,5\"",
+            b"\"e1\",u1,t,i,view,p1,\"5\"\r",
         ];
         for (i, l) in lines.iter().cycle().take(400).enumerate() {
             text.extend_from_slice(l);
