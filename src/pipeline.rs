@@ -52,7 +52,7 @@ impl Bits {
                 .unwrap_or(d)
         };
         Bits {
-            s1: lg(env("HELEX_S1_TARGET", 80_000)).clamp(6, 13),
+            s1: lg(env("HELEX_S1_TARGET", 10_000)).clamp(6, 13),
             p: lg(env("HELEX_P_TARGET", 40_000)).clamp(4, 11),
         }
     }
@@ -63,7 +63,7 @@ const LATE_LIMIT_MS: i64 = 86_400_000;
 const SESSION_GAP_MS: i64 = 1_800_000;
 const CLICK_REACH_MS: i64 = 7 * DAY_MS;
 
-const CHUNK_DEFAULT: u64 = 1 << 20;
+const CHUNK_DEFAULT: u64 = 256 << 10;
 
 fn chunk_bytes() -> u64 {
     std::env::var("HELEX_CHUNK_KB")
@@ -251,13 +251,7 @@ fn open_inputs(paths: &[PathBuf], kind: Kind, out: &mut Vec<InFile>) -> io::Resu
             continue;
         }
         let map = if use_mmap() {
-            let m = unsafe { memmap2::Mmap::map(&file) }.ok();
-            if let Some(m) = &m {
-                // Async whole-file readahead: starts the disk->cache fetch for
-                // the entire input while workers still populate per-chunk.
-                let _ = m.advise_range(memmap2::Advice::WillNeed, 0, len as usize);
-            }
-            m
+            unsafe { memmap2::Mmap::map(&file) }.ok()
         } else {
             None
         };
