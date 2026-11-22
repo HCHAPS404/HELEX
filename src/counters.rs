@@ -85,22 +85,76 @@ static DIGIT: [u8; 256] = {
 
 /// The base-36 value of `prefix + 1..=8 digits in [0-9a-z]` without a leading
 /// zero (unless the value is 0), below 2^40. Returns the scrambled value y.
+/// The field must be readable with 8 bytes of padding (chunk buffers are).
 #[inline]
 fn value(f: &[u8], prefix: u8) -> Option<u64> {
     let n = f.len();
     if n < 2 || n > 9 || f[0] != prefix || (n > 2 && f[1] == b'0') {
         return None;
     }
-    let mut y = 0u64;
-    for &c in &f[1..] {
-        let d = DIGIT[c as usize];
-        if d == 255 {
+    let m = n - 1;
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use std::arch::x86_64::*;
+        let v = _mm_loadl_epi64(f.as_ptr().add(1) as *const __m128i);
+        let num = _mm_and_si128(
+            _mm_cmpgt_epi8(v, _mm_set1_epi8(b'0' as i8 - 1)),
+            _mm_cmplt_epi8(v, _mm_set1_epi8(b'9' as i8 + 1)),
+        );
+        let lo = _mm_or_si128(v, _mm_set1_epi8(0x20));
+        let alpha = _mm_and_si128(
+            _mm_cmpgt_epi8(lo, _mm_set1_epi8(b'a' as i8 - 1)),
+            _mm_cmplt_epi8(lo, _mm_set1_epi8(b'z' as i8 + 1)),
+        );
+        let valid = _mm_movemask_epi8(_mm_or_si128(num, alpha)) as u32;
+        if valid & ((1u32 << m) - 1) != (1u32 << m) - 1 {
             return None;
         }
-        y = y * 36 + d as u64;
+        let dnum = _mm_sub_epi8(v, _mm_set1_epi8(b'0' as i8));
+        let dalp = _mm_sub_epi8(lo, _mm_set1_epi8((b'a' as i32 - 10) as i8));
+        let dig = _mm_or_si128(_mm_and_si128(num, dnum), _mm_and_si128(alpha, dalp));
+        // Right-align the m digits (leading lanes become 0) then Horner 36.
+        let shuf = SHUF[m - 1];
+        let dig = _mm_shuffle_epi8(dig, _mm_loadu_si128(shuf.as_ptr() as *const __m128i));
+        // pairs: (d0*36+d1, d2*36+d3, ...), then (p0*36^2+p1, p2*36^2+p3)
+        let pairs = _mm_maddubs_epi16(dig, _mm_set1_epi16(0x0124));
+        let quads = _mm_madd_epi16(pairs, _mm_set1_epi32(0x0001_0510));
+        let mut l = [0i32; 4];
+        _mm_storeu_si128(l.as_mut_ptr() as *mut __m128i, quads);
+        let y = (l[0] as u64) * 1_679_616 + l[1] as u64;
+        return (y <= MASK).then_some(y);
     }
-    (y <= MASK).then_some(y)
+    #[allow(unreachable_code)]
+    {
+        let mut y = 0u64;
+        for &c in &f[1..] {
+            let d = DIGIT[c as usize];
+            if d == 255 {
+                return None;
+            }
+            y = y * 36 + d as u64;
+        }
+        (y <= MASK).then_some(y)
+    }
 }
+
+/// Byte-shuffle tables: dest lane j (< 8) takes source byte j-(8-m) so the
+/// m loaded digits right-align; other lanes read 0xFF -> 0.
+static SHUF: [[u8; 16]; 8] = {
+    let mut t = [[0xFFu8; 16]; 8];
+    let mut m = 1usize;
+    while m <= 8 {
+        let mut j = 0usize;
+        while j < 8 {
+            if j >= 8 - m {
+                t[m - 1][j] = (j - (8 - m)) as u8;
+            }
+            j += 1;
+        }
+        m += 1;
+    }
+    t
+};
 
 /// The counter of a canonical id under `key`, if it is below `cap`.
 /// `cap == 0` accepts every counter (still 40-bit exact for equality).
