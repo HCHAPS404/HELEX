@@ -1034,7 +1034,7 @@ pub fn run_pipeline(
     let (p1_states, t_dsu) = std::thread::scope(|sc| {
         let dsu_thread = sc.spawn(|| {
             let t = Instant::now();
-            let _ = dsu_cell_ref.set(load_links(data_dir));
+            let _ = dsu_cell_ref.set(load_links(data_dir, threads));
             t.elapsed()
         });
         let states = par_tasks(
