@@ -219,8 +219,40 @@ pub fn for_each_record<const N: usize>(
                     fields[N - 1] = unsafe { line.get_unchecked(s..) };
                     f(&fields);
                 }
-            } else if let Some(fields) = split_fields_csv::<N>(line) {
-                f(&fields);
+            } else {
+                // Quoted line: quotes can only wrap whole fields (no value
+                // contains commas), so the comma mask still gives the field
+                // spans. Per field the quote bits must be exactly 0, or just
+                // the two boundary bytes which get stripped.
+                let mut c = window128(comma, pos) & lmask;
+                if c.count_ones() as usize == N - 1 {
+                    let mut fields: [&[u8]; N] = [&[]; N];
+                    let mut s = 0usize;
+                    let mut ok = true;
+                    for fi in 0..N {
+                        let e = if fi < N - 1 {
+                            let p = c.trailing_zeros() as usize;
+                            c &= c - 1;
+                            p
+                        } else {
+                            len
+                        };
+                        let fl = e - s;
+                        let qm = (q >> s) & ((1u128 << fl) - 1);
+                        if qm == 0 {
+                            fields[fi] = unsafe { line.get_unchecked(s..e) };
+                        } else if fl >= 2 && qm == (1u128 | (1u128 << (fl - 1))) {
+                            fields[fi] = unsafe { line.get_unchecked(s + 1..e - 1) };
+                        } else {
+                            ok = false;
+                            break;
+                        }
+                        s = e + 1;
+                    }
+                    if ok {
+                        f(&fields);
+                    }
+                }
             }
         } else if any_in(quote, pos, end) {
             if let Some(fields) = split_fields_csv::<N>(line) {

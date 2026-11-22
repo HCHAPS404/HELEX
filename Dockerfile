@@ -2,7 +2,7 @@ FROM rust:1.90-slim-bookworm AS builder
 
 # Static glibc (not musl): glibc's memcpy/memset are markedly faster for the
 # engine's bulk copies/fills, and a static-pie binary still runs FROM scratch.
-ENV RUSTFLAGS="-C target-cpu=x86-64-v2 -C target-feature=+crt-static"
+ENV RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+crt-static"
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir src && echo "fn main() {}" > src/main.rs \
