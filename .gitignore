@@ -10,3 +10,4 @@ __pycache__/
 generator_extracted/
 tools/synthgen/target/
 .bench-venv/
+vmbin/
