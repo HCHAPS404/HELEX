@@ -906,14 +906,7 @@ fn parse_click_line(
     if slow_u && st.slow_seen.get_or_insert(uk, 0).1 {
         push_slow(&mut st.slow_u, &mut st.slab, uk, user_raw);
     }
-    let canon = match pc
-        .dense_u
-        .and_then(|k| counters::decode(user_raw, b'u', k, counters::USER_CAP))
-        .and_then(|c| dsu.resolve_dense(c, uk))
-    {
-        Some(c) => c,
-        None => dsu.resolve(uk),
-    };
+    let canon = dsu.resolve(uk);
     let (cid_hi, cid_lo, long) = if click_id.len() <= 16 && memchr::memchr(0, click_id).is_none() {
         let mut b = [0u8; 16];
         b[..click_id.len()].copy_from_slice(click_id);
@@ -1083,7 +1076,7 @@ pub fn run_pipeline(
     let (p1_states, t_dsu) = std::thread::scope(|sc| {
         let dsu_thread = sc.spawn(|| {
             let t = Instant::now();
-            let _ = dsu_cell_ref.set(load_links(data_dir, threads, dense_u));
+            let _ = dsu_cell_ref.set(load_links(data_dir, threads));
             t.elapsed()
         });
         let states = par_tasks(

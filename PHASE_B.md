@@ -1,8 +1,23 @@
 # Phase B: dense user canon (handoff spec)
 
+**MEASURED 2026-11-23 — click-side dense canon is a small REGRESSION,
+reverted in-tree.** Implemented as `utab: Option<Vec<u64>>` indexed by
+`counter >> ALIAS_BITS` built post-DSU from link endpoints (commit
+`4c770ea`, reverted next commit): 36/36 fixtures + 60M MATCH, but A/B on
+data60v5 showed parse +0.27s, dsu +0.05s (~+0.2s total). Root cause: the
+bloom filter already rejects non-linked users for ~free; the utab turns
+that into a random read on an array up to 512MB. For linked users an
+array read replaces a KeyMap probe — a wash. The DEFF-style dense canon
+only pays when the resolve it replaces is more expensive than ours is.
+
+Do NOT resubmit the utab design. Remaining Phase-B value requires a
+different mechanism: (a) skip resolve work only where it exists —
+e.g. dense-aware emit that reuses winner canon, or (b) exploit dense
+ORDERING (counter-sorted groups) rather than indexed lookup.
+
 CONFIRMED 2026-11-23: `fe9c082` scored **1.4771s** official (was 1.5953)
 — entered finals as best score. Dense coverage on real scorer data is
-HIGH. Phase B (and any dense work) now has proven upside.
+HIGH. Dense work on the event/dedup path has proven upside.
 
 Commits to submit: use `fe9c082fe0217b6e3b7fa4bb703ebba299a6be3c` for
 the dense build. `bcd0899` adds prep wiring + this doc.

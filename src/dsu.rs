@@ -19,9 +19,6 @@ pub struct Dsu {
     canon: Vec<u64>,
     /// Slow-form member keys with their bytes (for output / registry).
     pub slow_bytes: Vec<(u64, Box<[u8]>)>,
-    /// Dense canon: user_index -> canon key for linked dense users.
-    /// `None` when dense keys are off or the index space collided.
-    utab: Option<Vec<u64>>,
 }
 
 impl Dsu {
@@ -38,20 +35,6 @@ impl Dsu {
             Some(i) => unsafe { *self.canon.get_unchecked(i as usize) },
             None => user_key,
         }
-    }
-
-    /// Canon for a dense-decoded user: the alias-indexed table answers
-    /// linked members; `byte_key` is returned for unlinked users. `None`
-    /// means the caller must use `resolve` (dense canon unavailable).
-    #[inline(always)]
-    pub fn resolve_dense(&self, counter: u64, byte_key: u64) -> Option<u64> {
-        let utab = self.utab.as_ref()?;
-        let u = (counter >> crate::counters::ALIAS_BITS) as usize;
-        Some(if u < utab.len() && utab[u] != 0 {
-            utab[u]
-        } else {
-            byte_key
-        })
     }
 }
 
@@ -170,26 +153,15 @@ struct LinkChunk {
     buckets: Vec<Vec<u64>>,
     slow: Vec<(u64, u32)>,
     slab: Vec<u8>,
-    /// (user_index, byte_key) for endpoints that decode to a dense counter;
-    /// used to build the post-DSU dense canon table.
-    dense: Vec<(u64, u64)>,
 }
 
 impl LinkChunk {
-    fn parse(&mut self, lines: &[u8], skip_header: bool, ukey: Option<u64>) {
+    fn parse(&mut self, lines: &[u8], skip_header: bool) {
         let mut handle = |line: &[u8]| {
             if let Some([a, b]) = split_fields_csv::<2>(line) {
                 if !a.is_empty() && !b.is_empty() {
                     let (ka, sa) = unsafe { id_key_padded(a, b'u') };
                     let (kb, sb) = unsafe { id_key_padded(b, b'u') };
-                    if let Some(k) = ukey {
-                        if let Some(c) = crate::counters::decode(a, b'u', k, crate::counters::USER_CAP) {
-                            self.dense.push((c >> crate::counters::ALIAS_BITS, ka));
-                        }
-                        if let Some(c) = crate::counters::decode(b, b'u', k, crate::counters::USER_CAP) {
-                            self.dense.push((c >> crate::counters::ALIAS_BITS, kb));
-                        }
-                    }
                     if sa {
                         self.slow.push((ka, self.slab.len() as u32));
                         self.slab.push(a.len() as u8);
@@ -219,7 +191,7 @@ fn slab_get(slab: &[u8], off: u32) -> &[u8] {
     &slab[off as usize + 1..off as usize + 1 + n]
 }
 
-pub fn load_links(data_dir: &Path, threads: usize, ukey: Option<u64>) -> io::Result<Dsu> {
+pub fn load_links(data_dir: &Path, threads: usize) -> io::Result<Dsu> {
     let paths = csv_paths(&data_dir.join("links"));
     let mut file_bufs: Vec<Vec<u8>> = Vec::with_capacity(paths.len());
     let mut _total_lines = 0usize;
@@ -278,9 +250,8 @@ pub fn load_links(data_dir: &Path, threads: usize, ukey: Option<u64>) -> io::Res
                         buckets: vec![Vec::new(); PARTS],
                         slow: Vec::new(),
                         slab: Vec::new(),
-                        dense: Vec::new(),
                     };
-                    c.parse(&bufs_ref[fi][s..e], hdr, ukey);
+                    c.parse(&bufs_ref[fi][s..e], hdr);
                     out.push((ti, c));
                 }
                 out
@@ -470,47 +441,11 @@ pub fn load_links(data_dir: &Path, threads: usize, ukey: Option<u64>) -> io::Res
         .filter_map(|(&k, s)| s.take().map(|b| (k, b)))
         .collect::<Vec<_>>();
     debug_assert!(slow_bytes.iter().all(|(k, _)| is_slow(*k)));
-
-    // Dense canon table: user_index (counter >> ALIAS_BITS) -> canon key.
-    // Disabled on any index collision (two members of different components
-    // sharing an index) or when the index space is too large.
-    let utab = if ukey.is_some() {
-        let pairs: Vec<(u64, u64)> = results
-            .iter()
-            .flat_map(|c| c.dense.iter().copied())
-            .collect();
-        let max_idx = pairs.iter().map(|p| p.0).max().unwrap_or(0);
-        if max_idx >= (1 << 26) {
-            None
-        } else {
-            let mut t = vec![0u64; max_idx as usize + 1];
-            let mut conflict = false;
-            for &(u, k) in &pairs {
-                let c = match map.get(k) {
-                    Some(i) => canon[i as usize],
-                    None => k,
-                };
-                if t[u as usize] != 0 && t[u as usize] != c {
-                    conflict = true;
-                    break;
-                }
-                t[u as usize] = c;
-            }
-            if conflict {
-                None
-            } else {
-                Some(t)
-            }
-        }
-    } else {
-        None
-    };
     Ok(Dsu {
         filter,
         fbits,
         map,
         canon,
-        utab,
         slow_bytes,
     })
 }
