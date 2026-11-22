@@ -216,30 +216,31 @@ pub fn for_each_record<const N: usize>(
                     q & !(left_ok | right_ok) == 0
                 };
                 if ok {
+                    // Branchless field cut: a quoted field has a quote bit at
+                    // its first and last byte; strip both, reject if only one
+                    // side is quoted or the field is a lone quote.
                     let mut fields: [&[u8]; N] = [&[]; N];
                     let mut s = 0usize;
-                    for fi in fields.iter_mut().take(N - 1) {
-                        let p = c.trailing_zeros() as usize;
-                        c &= c - 1;
-                        *fi = unsafe { line.get_unchecked(s..p) };
+                    let mut bad = 0u32;
+                    for fi in 0..N {
+                        let p = if fi + 1 < N {
+                            let p = c.trailing_zeros() as usize;
+                            c &= c.wrapping_sub(1);
+                            p
+                        } else {
+                            len
+                        };
+                        let nonempty = (p > s) as u32;
+                        let lead = ((q >> (s & 127)) as u32 & 1) & nonempty;
+                        let tail = ((q >> (p.wrapping_sub(1) & 127)) as u32 & 1) & nonempty;
+                        let short = (p - s < 2) as u32;
+                        bad |= (lead ^ tail) | (lead & short);
+                        let a = s + lead as usize;
+                        let b = (p - tail as usize).max(a);
+                        fields[fi] = unsafe { line.get_unchecked(a..b) };
                         s = p + 1;
                     }
-                    fields[N - 1] = unsafe { line.get_unchecked(s..) };
-                    let mut good = true;
-                    if q != 0 {
-                        for fi in fields.iter_mut() {
-                            let fl = fi.len();
-                            let lead = fl > 0 && fi[0] == b'"';
-                            let tail = fl > 0 && fi[fl - 1] == b'"';
-                            if lead != tail || (lead && fl < 2) {
-                                good = false;
-                                break;
-                            }
-                            if lead {
-                                *fi = unsafe { fi.get_unchecked(1..fl - 1) };
-                            }
-                        }
-                    }
+                    let good = bad == 0;
                     if good {
                         f(&fields);
                     }

@@ -195,11 +195,80 @@ unsafe fn parse_civil_swar(p: *const u8) -> Option<i64> {
 /// At least 24 bytes from `b.as_ptr()` must be readable (padded buffer).
 #[inline(always)]
 pub unsafe fn parse_ts_padded(b: &[u8]) -> Option<i64> {
-    if b.len() == 20 && *b.get_unchecked(19) == b'Z' {
-        parse_civil_swar(b.as_ptr())
-    } else {
-        parse_timestamp(b)
+    let n = b.len();
+    let p = b.as_ptr();
+    if n == 20 && *p.add(19) == b'Z' {
+        return parse_civil_swar(p);
     }
+    if n >= 1 && n <= 16 && (*p).wrapping_sub(b'0') <= 9 {
+        return parse_digits16(p, n);
+    }
+    if n == 25 {
+        let sign = *p.add(19);
+        if (sign == b'+' || sign == b'-') && *p.add(22) == b':' {
+            let local_ms = parse_civil_swar(p)?;
+            let oh = two_digits(p.add(20))?;
+            let om = two_digits(p.add(23))?;
+            if oh > 23 || om > 59 {
+                return None;
+            }
+            let off = i64::from(oh * 3_600 + om * 60) * 1_000;
+            return Some(if sign == b'+' { local_ms - off } else { local_ms + off });
+        }
+    }
+    parse_timestamp(b)
+}
+
+#[inline(always)]
+unsafe fn two_digits(p: *const u8) -> Option<u32> {
+    let a = (*p).wrapping_sub(b'0');
+    let b = (*p.add(1)).wrapping_sub(b'0');
+    if a > 9 || b > 9 {
+        return None;
+    }
+    Some(u32::from(a) * 10 + u32::from(b))
+}
+
+/// Value of 8 ASCII digits loaded little-endian (first char most significant).
+#[inline(always)]
+fn swar8(v: u64) -> u64 {
+    let v = v.wrapping_sub(ASCII0);
+    let v = (v.wrapping_mul(10) + (v >> 8)) & 0x00FF_00FF_00FF_00FF;
+    let v = (v.wrapping_mul(100) + (v >> 16)) & 0x0000_FFFF_0000_FFFF;
+    (v.wrapping_mul(10_000) + (v >> 32)) & 0xFFFF_FFFF
+}
+
+#[inline(always)]
+fn all_digits8(v: u64) -> bool {
+    let d = v ^ ASCII0;
+    (d & HI_NIB) == 0 && ((d + SIX) & HI_NIB) == 0
+}
+
+/// F3: 1..=16 ASCII digits (value < 10^16, no overflow possible).
+///
+/// # Safety
+/// 16 bytes from `p` must be readable.
+#[inline(always)]
+unsafe fn parse_digits16(p: *const u8, n: usize) -> Option<i64> {
+    // Right-align the digits into two 8-digit words padded with '0'.
+    let lo_n = n.min(8);
+    let hi_n = n - lo_n;
+    let lo_raw = std::ptr::read_unaligned(p.add(hi_n) as *const u64);
+    let lo = if lo_n == 8 {
+        lo_raw
+    } else {
+        (lo_raw << (8 * (8 - lo_n))) | (ASCII0 >> (8 * lo_n))
+    };
+    let hi = if hi_n == 0 {
+        ASCII0
+    } else {
+        let raw = std::ptr::read_unaligned(p as *const u64);
+        (raw << (8 * (8 - hi_n))) | (ASCII0 >> (8 * hi_n))
+    };
+    if !(all_digits8(lo) && all_digits8(hi)) {
+        return None;
+    }
+    Some((swar8(hi) * 100_000_000 + swar8(lo)) as i64)
 }
 
 #[inline]
@@ -286,6 +355,24 @@ mod tests {
     #[test]
     fn swar_matches_scalar() {
         let mut cases: Vec<Vec<u8>> = vec![
+            b"1752993097682".to_vec(),
+            b"0".to_vec(),
+            b"7".to_vec(),
+            b"00000000".to_vec(),
+            b"123456789".to_vec(),
+            b"9999999999999999".to_vec(),
+            b"99999999999999999".to_vec(),
+            b"1752993097682.0".to_vec(),
+            b"17529930976a2".to_vec(),
+            b"1.75e12".to_vec(),
+            b"-5".to_vec(),
+            b"2025-07-22T12:18:48+05:30".to_vec(),
+            b"2025-07-22T12:18:48-00:00".to_vec(),
+            b"2025-07-22T12:18:48+24:00".to_vec(),
+            b"2025-07-22T12:18:48+05:60".to_vec(),
+            b"2025-07-22T12:18:48+0530".to_vec(),
+            b"2025-07-22T12:18:48*05:30".to_vec(),
+            b"2025-07-22T12:18:48+0a:30".to_vec(),
             b"2026-10-03T23:58:10Z".to_vec(),
             b"2028-02-29T00:00:00Z".to_vec(),
             b"2027-02-29T00:00:00Z".to_vec(),
@@ -325,6 +412,17 @@ mod tests {
             for c in b'0'..=b'9' {
                 let mut v = base.to_vec();
                 v[i] = c;
+                cases.push(v);
+            }
+        }
+        for k in 1..=16usize {
+            for d in [b'0', b'5', b'9'] {
+                let mut v = vec![d; k];
+                v[0] = b'1';
+                cases.push(v.clone());
+                v[k - 1] = b'/';
+                cases.push(v.clone());
+                v[k - 1] = b':';
                 cases.push(v);
             }
         }
