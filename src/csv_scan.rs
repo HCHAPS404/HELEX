@@ -246,9 +246,14 @@ unsafe fn scan_lines_avx2<const N: usize>(
             | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(c, vq)) as u32 as u64) << 32);
         (n, cm, q)
     }
+    let pf_dist = prefetch_dist();
     while pos < limit && pos < blen {
         let rem = blen - pos;
         let p = base.add(pos);
+        if pf_dist != 0 {
+            // stay ahead of the hardware prefetcher across 4 KiB page breaks
+            _mm_prefetch(p.add(pf_dist) as *const i8, _MM_HINT_T0);
+        }
         let (n0, c0, q0) = masks64(p, vn, vc, vq);
         let lim0 = low_mask(rem.min(64));
         let n0 = n0 & lim0;
@@ -294,6 +299,16 @@ unsafe fn scan_lines_avx2<const N: usize>(
         }
         pos += len + 1;
     }
+}
+
+fn prefetch_dist() -> usize {
+    static D: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *D.get_or_init(|| {
+        std::env::var("HELEX_PF")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2048)
+    })
 }
 
 #[cfg(target_arch = "x86_64")]
