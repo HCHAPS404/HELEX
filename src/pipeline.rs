@@ -1223,11 +1223,14 @@ pub fn run_pipeline(
             let tab = &mut st.tab[..cap];
             for w in evb.iter() {
                 for b in w[s].iter() {
-                    let recs = b.as_slice();
-                    for (i, r) in recs.iter().enumerate() {
+                    // Raw pointers: losers are written in place (user = 0).
+                    let base = b.ptr;
+                    let nrec = b.n as usize;
+                    for i in 0..nrec {
                         #[cfg(target_arch = "x86_64")]
-                        if let Some(nx) = recs.get(i + 8) {
-                            let slot = (mix64(nx.key) as usize) & mask;
+                        if i + 8 < nrec {
+                            let nk = unsafe { (*base.add(i + 8)).key };
+                            let slot = (mix64(nk) as usize) & mask;
                             unsafe {
                                 core::arch::x86_64::_mm_prefetch(
                                     tab.as_ptr().add(slot) as *const i8,
@@ -1235,8 +1238,9 @@ pub fn run_pipeline(
                                 );
                             }
                         }
-                        let k = r.key;
-                        let addr = r as *const EvRec as u64;
+                        let rp = unsafe { base.add(i) };
+                        let (k, ingest) = unsafe { ((*rp).key, (*rp).ingest) };
+                        let addr = rp as u64;
                         let mut j = (mix64(k) as usize) & mask;
                         loop {
                             let e = unsafe { tab.get_unchecked_mut(j) };
@@ -1245,9 +1249,16 @@ pub fn run_pipeline(
                                 break;
                             }
                             if e[0] == k {
-                                let cur = unsafe { &*(e[1] as *const EvRec) };
-                                if r.ingest < cur.ingest {
-                                    e[1] = addr;
+                                // Duplicate: the loser is retired in place
+                                // (user = 0), so the emit pass needs no probe.
+                                let cur = e[1] as *mut EvRec;
+                                unsafe {
+                                    if ingest < (*cur).ingest {
+                                        (*cur).user = 0;
+                                        e[1] = addr;
+                                    } else {
+                                        (*rp).user = 0;
+                                    }
                                 }
                                 break;
                             }
@@ -1256,8 +1267,8 @@ pub fn run_pipeline(
                     }
                 }
             }
-            // Winner emit: sequential re-scan of the records (the table is
-            // cache-resident), instead of random record reads from the table.
+            // Winner emit: losers were retired during insert, so every record
+            // still carrying a user is a valid winner.
             for w in evb.iter() {
                 for b in w[s].iter() {
                     let recs = b.as_slice();
@@ -1270,19 +1281,12 @@ pub fn run_pipeline(
                         if r.user == 0 {
                             continue;
                         }
-                        let k = r.key;
-                        let mut j = (mix64(k) as usize) & mask;
-                        while unsafe { tab.get_unchecked(j)[0] } != k {
-                            j = (j + 1) & mask;
-                        }
-                        if unsafe { tab.get_unchecked(j)[1] } == r as *const EvRec as u64 {
-                            let canon = dsu_r.resolve(r.user);
-                            st.out.push(
-                                arena_ref,
-                                shard_of(canon, bits.p),
-                                PRec { canon, ev: r.ev },
-                            );
-                        }
+                        let canon = dsu_r.resolve(r.user);
+                        st.out.push(
+                            arena_ref,
+                            shard_of(canon, bits.p),
+                            PRec { canon, ev: r.ev },
+                        );
                     }
                 }
             }
