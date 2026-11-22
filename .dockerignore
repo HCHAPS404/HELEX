@@ -9,4 +9,4 @@ requirements.txt
 .git/
 .devin/
 scripts/
-tools/
+tools/synthgen/
