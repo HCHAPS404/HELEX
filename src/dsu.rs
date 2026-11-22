@@ -75,7 +75,7 @@ type Parsed = (Vec<(u64, u64)>, Vec<(u64, Box<[u8]>)>);
 fn parse_links_file(p: &Path) -> io::Result<Parsed> {
     let mut bytes = fs::read(p)?;
     let len = bytes.len();
-    bytes.resize(len + 64, 0); // padding for wide loads
+    bytes.resize(len + crate::csv_scan::SCAN_PAD, 0); // padding for wide loads
     let data = &bytes[..len];
     let mut pairs = Vec::with_capacity(len / 22 + 16);
     let mut slow = Vec::new();

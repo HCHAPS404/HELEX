@@ -153,6 +153,159 @@ fn window128(mask: &[u64], pos: usize) -> u128 {
     }
 }
 
+#[inline(always)]
+fn low_mask(n: usize) -> u64 {
+    if n == 0 {
+        0
+    } else {
+        u64::MAX >> (64 - n)
+    }
+}
+
+/// Splits one line given its comma/quote bitmaps (bit i = byte i of the
+/// line), under the `split_fields_csv` dialect.
+#[inline(always)]
+fn cut_fields<'a, const N: usize>(line: &'a [u8], mut c: u128, q: u128) -> Option<[&'a [u8]; N]> {
+    let len = line.len();
+    if c.count_ones() as usize != N - 1 {
+        return None;
+    }
+    if q != 0 {
+        let left_ok = (c << 1) | 1;
+        let right_ok = (c >> 1) | (1u128 << (len - 1));
+        if q & !(left_ok | right_ok) != 0 {
+            return None;
+        }
+    }
+    let mut fields: [&[u8]; N] = [&[]; N];
+    let mut s = 0usize;
+    let mut bad = 0u32;
+    for fi in 0..N {
+        let p = if fi + 1 < N {
+            let p = c.trailing_zeros() as usize;
+            c &= c.wrapping_sub(1);
+            p
+        } else {
+            len
+        };
+        let (a, b) = if q == 0 {
+            (s, p)
+        } else {
+            let nonempty = (p > s) as u32;
+            let lead = (unsafe { *line.get_unchecked(s.min(len - 1)) } == b'"') as u32 & nonempty;
+            let tail = (unsafe { *line.get_unchecked(p.max(1) - 1) } == b'"') as u32 & nonempty;
+            let short = (p - s < 2) as u32;
+            bad |= (lead ^ tail) | (lead & short);
+            let a = s + lead as usize;
+            (a, (p - tail as usize).max(a))
+        };
+        fields[fi] = unsafe { line.get_unchecked(a..b) };
+        s = p + 1;
+    }
+    if bad == 0 {
+        Some(fields)
+    } else {
+        None
+    }
+}
+
+/// Per-line AVX2 scan: each line's newline/comma/quote masks come straight
+/// from 64 (or 128) bytes loaded at the line start. Requires >= 128 readable
+/// bytes past `b.len()` (padded buffers).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,popcnt,bmi1")]
+unsafe fn scan_lines_avx2<const N: usize>(
+    b: &[u8],
+    first: bool,
+    limit: usize,
+    f: &mut impl FnMut(&[&[u8]; N]),
+) {
+    use std::arch::x86_64::*;
+    let vn = _mm256_set1_epi8(b'\n' as i8);
+    let vc = _mm256_set1_epi8(b',' as i8);
+    let vq = _mm256_set1_epi8(b'"' as i8);
+    let base = b.as_ptr();
+    let blen = b.len();
+    let mut pos = if first {
+        0
+    } else {
+        match memchr::memchr(b'\n', b) {
+            Some(p) => p + 1,
+            None => return,
+        }
+    };
+    #[inline(always)]
+    unsafe fn masks64(p: *const u8, vn: __m256i, vc: __m256i, vq: __m256i) -> (u64, u64, u64) {
+        let a = _mm256_loadu_si256(p as *const __m256i);
+        let c = _mm256_loadu_si256(p.add(32) as *const __m256i);
+        let n = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, vn)) as u32 as u64)
+            | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(c, vn)) as u32 as u64) << 32);
+        let cm = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, vc)) as u32 as u64)
+            | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(c, vc)) as u32 as u64) << 32);
+        let q = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, vq)) as u32 as u64)
+            | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(c, vq)) as u32 as u64) << 32);
+        (n, cm, q)
+    }
+    while pos < limit && pos < blen {
+        let rem = blen - pos;
+        let p = base.add(pos);
+        let (n0, c0, q0) = masks64(p, vn, vc, vq);
+        let lim0 = low_mask(rem.min(64));
+        let n0 = n0 & lim0;
+        let (len, c, q);
+        if n0 != 0 {
+            len = n0.trailing_zeros() as usize;
+            let m = low_mask(len);
+            c = (c0 & m) as u128;
+            q = (q0 & m) as u128;
+        } else if rem <= 64 {
+            len = rem;
+            c = (c0 & lim0) as u128;
+            q = (q0 & lim0) as u128;
+        } else {
+            let (n1, c1, q1) = masks64(p.add(64), vn, vc, vq);
+            let lim1 = low_mask((rem - 64).min(64));
+            let n1 = n1 & lim1;
+            if n1 != 0 {
+                let l1 = n1.trailing_zeros() as usize;
+                len = 64 + l1;
+                let m = low_mask(l1);
+                c = (c0 as u128) | (((c1 & m) as u128) << 64);
+                q = (q0 as u128) | (((q1 & m) as u128) << 64);
+            } else if rem <= 128 {
+                len = rem;
+                c = (c0 as u128) | (((c1 & lim1) as u128) << 64);
+                q = (q0 as u128) | (((q1 & lim1) as u128) << 64);
+            } else {
+                // line longer than 128 bytes: exact generic path
+                let e = memchr::memchr(b'\n', &b[pos..]).map_or(blen, |r| pos + r);
+                if let Some(fields) = split_fields_csv::<N>(&b[pos..e]) {
+                    f(&fields);
+                }
+                pos = e + 1;
+                continue;
+            }
+        }
+        let line = std::slice::from_raw_parts(p, len);
+        if len > 0 {
+            if let Some(fields) = cut_fields::<N>(line, c, q) {
+                f(&fields);
+            }
+        }
+        pos += len + 1;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn use_line_scan() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| has_avx2() && std::env::var_os("HELEX_SCAN_BITMAP").is_none())
+}
+
+/// Bytes that must be readable past the end of a slice handed to
+/// [`for_each_record`].
+pub const SCAN_PAD: usize = 192;
+
 /// Calls `f(fields)` for every line that starts in `b[..limit]` (after the
 /// partial first line unless `first`) and splits into exactly N fields under
 /// the `split_fields_csv` dialect. Lines that do not split are skipped, as the
@@ -165,6 +318,11 @@ pub fn for_each_record<const N: usize>(
     masks: &mut Masks,
     mut f: impl FnMut(&[&[u8]; N]),
 ) {
+    #[cfg(target_arch = "x86_64")]
+    if use_line_scan() {
+        unsafe { scan_lines_avx2::<N>(b, first, limit, &mut f) };
+        return;
+    }
     masks.build(b);
     let nl = &masks.nl;
     let comma = &masks.comma;
@@ -301,6 +459,51 @@ mod tests {
     }
 
     #[test]
+    fn fuzz_matches_generic_splitter() {
+        // xorshift fuzz over short/long lines built from a CSV-hostile alphabet
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut rnd = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let alpha = b"ab,\"\r 0\n,,\"\"x";
+        let mut m = Masks::default();
+        for round in 0..300 {
+            let mut text = Vec::new();
+            let lines = 1 + rnd() % 40;
+            for _ in 0..lines {
+                let len = match rnd() % 4 {
+                    0 => rnd() % 20,
+                    1 => 50 + rnd() % 30,
+                    2 => 60 + rnd() % 80,
+                    _ => rnd() % 200,
+                };
+                for _ in 0..len {
+                    text.push(alpha[(rnd() % alpha.len() as u64) as usize]);
+                }
+                text.push(b'\n');
+            }
+            if round % 3 == 0 {
+                text.pop();
+            }
+            let tl = text.len();
+            text.extend_from_slice(&[b'\n', b',', b'"'].repeat(SCAN_PAD));
+            let t = &text[..tl];
+            for first in [true, false] {
+                for limit in [1usize, 7, 64, 129, tl / 2 + 1, tl] {
+                    let mut got: Vec<Vec<Vec<u8>>> = Vec::new();
+                    for_each_record::<4>(t, first, limit, &mut m, |f| {
+                        got.push(f.iter().map(|x| x.to_vec()).collect())
+                    });
+                    assert_eq!(got, generic::<4>(t, first, limit), "round={round}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn matches_generic_splitter() {
         let mut text = Vec::new();
         let lines: Vec<&[u8]> = vec![
@@ -337,14 +540,19 @@ mod tests {
             text.push(b'\n');
         }
         text.extend_from_slice(b"e9,u9,ts,ing,view,p1,5");
+        let tl = text.len();
+        // stale bytes in the padding must never be read as data
+        text.extend_from_slice(&[b'\n', b',', b'"'].repeat(SCAN_PAD));
+        let text_padded = text;
+        let text = &text_padded[..tl];
         let mut m = Masks::default();
         for first in [true, false] {
             for limit in [1usize, 50, 63, 64, 65, 127, 128, 1000, text.len()] {
                 let mut got: Vec<Vec<Vec<u8>>> = Vec::new();
-                for_each_record::<7>(&text, first, limit, &mut m, |f| {
+                for_each_record::<7>(text, first, limit, &mut m, |f| {
                     got.push(f.iter().map(|x| x.to_vec()).collect())
                 });
-                assert_eq!(got, generic::<7>(&text, first, limit), "first={first} limit={limit}");
+                assert_eq!(got, generic::<7>(text, first, limit), "first={first} limit={limit}");
             }
         }
     }

@@ -72,7 +72,7 @@ fn chunk_bytes() -> u64 {
         .map_or(CHUNK_DEFAULT, |kb| (kb.max(4)) << 10)
 }
 const TAIL: u64 = 16 << 10;
-const PAD: usize = 64;
+const PAD: usize = crate::csv_scan::SCAN_PAD;
 
 // Packed event: rel_ms:32 | price_cents:24 | cat_id:7 | is_purchase:1.
 #[inline(always)]
