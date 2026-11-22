@@ -542,7 +542,7 @@ fn emit_shard(
     win_bits: &[Vec<u64>],
     link_maps: &[LinkMap],
     utab: &[UEnt],
-    ukey: u64,
+    ukey: Option<u64>,
     dsu: &UnionFind,
     side_emit: &[Mutex<Vec<(u64, SmallBytes)>>],
     parts: &mut Vec<Vec<Rec16>>,
@@ -564,14 +564,14 @@ fn emit_shard(
                 let rec = &sb.recs[r];
                 let uk = rec.user_key;
                 let ck = if rec.user_loc == ID_DENSE {
-                    dense_canon(uk, utab, dsu, ukey, side_emit)
+                    dense_canon(uk, utab, dsu, ukey.unwrap_or(0), side_emit)
                 } else if rec.user_loc == u32::MAX && uk != 0 {
                     link_maps[(uk >> SHARD_SHIFT) as usize].get(uk).unwrap_or(uk)
                 } else {
                     let bytes =
                         key_bytes(uk, b'u', &sb.side, rec.user_loc, &mut tmp_a);
                     let canon = dsu.resolve(bytes);
-                    let (ck, cslow) = field_key(canon, b'u');
+                    let (ck, cslow) = canon_key_of(canon, ukey);
                     if cslow || ck == 0 {
                         side_emit[(ck >> SHARD_SHIFT) as usize]
                             .lock()
@@ -1463,7 +1463,7 @@ pub fn run_pipeline(
                         &bits,
                         link_maps_ref,
                         utab_ref,
-                        ukey_v,
+                        us_key,
                         dsu_ref,
                         se_ref,
                         &mut parts,
