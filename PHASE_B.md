@@ -1,5 +1,12 @@
 # Phase B: dense user canon (handoff spec)
 
+CONFIRMED 2026-11-23: `fe9c082` scored **1.4771s** official (was 1.5953)
+— entered finals as best score. Dense coverage on real scorer data is
+HIGH. Phase B (and any dense work) now has proven upside.
+
+Commits to submit: use `fe9c082fe0217b6e3b7fa4bb703ebba299a6be3c` for
+the dense build. `bcd0899` adds prep wiring + this doc.
+
 State: `opt/post-alex` @ `fe9c082` has dense EVENT dedup (`counters.rs`,
 `PCtx.dense_e`, `EvRec.ingest` bit63 = event-dense flag, `P2.dtab` direct
 table generation-stamped by shard, `P2.dhash` overflow, win-bitmap emit).
@@ -103,6 +110,21 @@ official) — do it AFTER confirming dense coverage is high on scorer data.
    and apply only to CLICKS (CkRec.canon is computed in-parse anyway —
    dense canon just speeds that resolve: `CkRec` gets `ucnt: u32` packed
    or reuse `long` field). Clicks are 15M vs 60M events — smaller win.
+
+## Post-1.4771 priority order
+
+1. **Clicks dense canon** (cleanest slice): `parse_click_line` resolves
+   `canon = dsu.resolve(uk)` inline — replace with `utab[c>>9]` when the
+   user id decodes (falls back to resolve otherwise). Needs utab built
+   post-DSU: decode link endpoints in `load_links`, collect
+   `(counter>>9 -> member byte key)` pairs, then `utab[u] =
+   dsu.resolve(member_key)`. utab can be sparse/KeyMap-sized to actual
+   link count, not 2^27 — links are ~10M in this data. Value = canon KEY
+   so downstream code is untouched.
+2. **Emit dense canon** (bigger, needs the record-side work in the
+   section below).
+3. **EvRec repack** (40B->32B or drop ingest post-dedup): frees emit
+   bandwidth — independent of dense.
 
 ## Verification gates (same as always)
 
