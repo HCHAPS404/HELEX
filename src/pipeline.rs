@@ -151,6 +151,8 @@ struct PCtx<'a> {
     camp: KeyMap,
     /// recovered generator event key: (key, shard_shift, index_mask)
     dense_e: Option<(u64, u32, u64)>,
+    /// recovered generator user key (Phase B: dense canon)
+    dense_u: Option<u64>,
 }
 
 impl PCtx<'_> {
@@ -1042,19 +1044,26 @@ pub fn run_pipeline(
             }
         })
         .collect();
-    let dense_e = counters::recover(&heads).and_then(|k| {
+    let keys = counters::recover(&heads);
+    let dense_e = keys.and_then(|k| {
         if k.ok && bits.s1 <= 28 {
             Some((k.event, 28 - bits.s1, (1u64 << (28 - bits.s1)) - 1))
         } else {
             None
         }
     });
-    eprintln!("[dense] enabled={}", dense_e.is_some());
+    let dense_u = keys.and_then(|k| if k.ok { Some(k.user) } else { None });
+    eprintln!(
+        "[dense] events={} users={}",
+        dense_e.is_some(),
+        dense_u.is_some()
+    );
     let pctx = PCtx {
         catalog: &catalog,
         prod,
         camp,
         dense_e,
+        dense_u,
     };
     let pctx_ref = &pctx;
     let arena = Arena::new();
