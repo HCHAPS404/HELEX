@@ -524,6 +524,8 @@ struct P1 {
     long_cids: Vec<Box<[u8]>>,
     ck_pend: Vec<CkRec>,
     ck_defer: Vec<CkRec>,
+    ev_pend: [(usize, Ev24); EV_BATCH],
+    ev_pend_n: usize,
     buf: Vec<u8>,
     masks: Masks,
     err: Option<io::Error>,
@@ -968,7 +970,13 @@ fn flush_rows(st: &mut P3, dir: &Path) {
 // ------------------------------------------------------------- line parsers
 
 #[inline(always)]
-fn parse_event_line(st: &mut P1, fields: &[&[u8]; 7], pc: &PCtx, arena: &Arena) {
+fn parse_event_line(
+    st: &mut P1,
+    fields: &[&[u8]; 7],
+    pc: &PCtx,
+    arena: &Arena,
+    dsu: Option<&Dsu>,
+) {
     let event_id = fields[0];
     if event_id.is_empty() {
         return;
@@ -988,8 +996,10 @@ fn parse_event_line(st: &mut P1, fields: &[&[u8]; 7], pc: &PCtx, arena: &Arena) 
             let rel = ev >> 32;
             let delta = ingest - (pc.catalog.window_start + rel as i64);
             if ev as u32 == 0 && delta >= i64::from(i32::MIN) && delta <= i64::from(i32::MAX) {
-                st.ev.push(
+                push_ev(
+                    st,
                     arena,
+                    dsu,
                     shard,
                     Ev24 {
                         key,
@@ -1001,13 +1011,15 @@ fn parse_event_line(st: &mut P1, fields: &[&[u8]; 7], pc: &PCtx, arena: &Arena) 
                 st.wide.push(EvRec {
                     key,
                     ingest,
-                    user: uk,
+                    user: dsu.map_or(uk, |d| d.resolve(uk)),
                     ev,
                 });
             }
         }
-        None => st.ev.push(
+        None => push_ev(
+            st,
             arena,
+            dsu,
             shard,
             Ev24 {
                 key,
@@ -1016,6 +1028,41 @@ fn parse_event_line(st: &mut P1, fields: &[&[u8]; 7], pc: &PCtx, arena: &Arena) 
             },
         ),
     }
+}
+
+const EV_BATCH: usize = 16;
+
+/// With the DSU ready at parse time, the user key is replaced by its
+/// canonical person key: lookups are prefetched and resolved in batches of
+/// EV_BATCH (in file order, so per-shard insertion order is unchanged).
+#[inline(always)]
+fn push_ev(st: &mut P1, arena: &Arena, dsu: Option<&Dsu>, shard: usize, r: Ev24) {
+    match dsu {
+        None => st.ev.push(arena, shard, r),
+        Some(d) => {
+            if r.user != 0 {
+                d.prefetch(r.user);
+            }
+            let n = st.ev_pend_n;
+            st.ev_pend[n] = (shard, r);
+            st.ev_pend_n = n + 1;
+            if n + 1 == EV_BATCH {
+                flush_events(st, d, arena);
+            }
+        }
+    }
+}
+
+#[inline]
+fn flush_events(st: &mut P1, dsu: &Dsu, arena: &Arena) {
+    for i in 0..st.ev_pend_n {
+        let (shard, mut r) = st.ev_pend[i];
+        if r.user != 0 {
+            r.user = dsu.resolve(r.user);
+        }
+        st.ev.push(arena, shard, r);
+    }
+    st.ev_pend_n = 0;
 }
 
 /// Records a slow user id's bytes once per worker.
@@ -1206,7 +1253,6 @@ pub fn run_pipeline(
     // Linked IDs build concurrently with event parsing (event chunks come
     // first in the task order); click chunks wait for it.
     let dsu_cell: std::sync::OnceLock<io::Result<Dsu>> = std::sync::OnceLock::new();
-    let dsu_cell_ref = &dsu_cell;
     // DSU work is short (~0.2 CPU-s); all threads keep its serial span small
     // even while it competes with the parse workers.
     let dsu_threads = std::env::var("HELEX_DSU_THREADS")
@@ -1225,9 +1271,22 @@ pub fn run_pipeline(
     let ra_done = std::sync::atomic::AtomicBool::new(false);
     let ra_done_ref = &ra_done;
     let t_setup = t1.elapsed();
+    // Early mode: build the linked-ID map first (all threads) and resolve
+    // persons during parse; the dedup emit then needs no lookups.
+    let early_dsu = std::env::var("HELEX_DSU_EARLY").is_ok_and(|v| v == "1");
+    let mut t_dsu_early = std::time::Duration::ZERO;
+    if early_dsu {
+        let t = Instant::now();
+        let _ = dsu_cell.set(load_links(data_dir, threads));
+        t_dsu_early = t.elapsed();
+    }
+    let dsu_cell_ref = &dsu_cell;
     let (p1_states, t_dsu) = std::thread::scope(|sc| {
         let dsu_thread = sc.spawn(move || {
             let t = Instant::now();
+            if early_dsu {
+                return t_dsu_early;
+            }
             // test hook: force the deferred-click path
             if let Some(ms) = std::env::var("HELEX_TEST_DSU_DELAY_MS")
                 .ok()
@@ -1289,6 +1348,8 @@ pub fn run_pipeline(
                 long_cids: Vec::new(),
                 ck_pend: Vec::with_capacity(CK_BATCH),
                 ck_defer: Vec::new(),
+                ev_pend: [(0, Ev24 { key: 0, user: 0, w: 0 }); EV_BATCH],
+                ev_pend_n: 0,
                 buf: Vec::with_capacity((chunk + TAIL) as usize + PAD),
                 masks: Masks::default(),
                 err: None,
@@ -1303,11 +1364,22 @@ pub fn run_pipeline(
                 let mut buf = std::mem::take(&mut st.buf);
                 let mut masks = std::mem::take(&mut st.masks);
                 let res = match f.kind {
-                    Kind::Events => run_chunk(f, task.start, task.end, &mut buf, |b, first, limit| {
-                        for_each_record::<7>(b, first, limit, &mut masks, #[inline(always)] |fields| {
-                            parse_event_line(st, fields, pctx_ref, arena_ref)
-                        })
-                    }),
+                    Kind::Events => {
+                        let dsu = if early_dsu {
+                            dsu_cell_ref.get().and_then(|r| r.as_ref().ok())
+                        } else {
+                            None
+                        };
+                        let r = run_chunk(f, task.start, task.end, &mut buf, |b, first, limit| {
+                            for_each_record::<7>(b, first, limit, &mut masks, #[inline(always)] |fields| {
+                                parse_event_line(st, fields, pctx_ref, arena_ref, dsu)
+                            })
+                        });
+                        if let Some(d) = dsu {
+                            flush_events(st, d, arena_ref);
+                        }
+                        r
+                    }
                     Kind::Clicks => {
                         // Never wait for the linked-ID build: clicks parsed
                         // before it is ready are resolved after phase 1.
@@ -1565,15 +1637,17 @@ pub fn run_pipeline(
                 for b in w[s].iter() {
                     let recs = b.as_slice();
                     for (i, r) in recs.iter().enumerate() {
-                        if let Some(nx) = recs.get(i + 12) {
-                            if nx.user != 0 {
-                                dsu_r.prefetch(nx.user);
+                        if !early_dsu {
+                            if let Some(nx) = recs.get(i + 12) {
+                                if nx.user != 0 {
+                                    dsu_r.prefetch(nx.user);
+                                }
                             }
                         }
                         if r.user == 0 {
                             continue;
                         }
-                        let canon = dsu_r.resolve(r.user);
+                        let canon = if early_dsu { r.user } else { dsu_r.resolve(r.user) };
                         st.out.push(
                             arena_ref,
                             shard_of(canon, bits.p),
@@ -1590,7 +1664,7 @@ pub fn run_pipeline(
                 if r.user == 0 {
                     continue;
                 }
-                let canon = dsu_r.resolve(r.user);
+                let canon = if early_dsu { r.user } else { dsu_r.resolve(r.user) };
                 st.out.push(
                     arena_ref,
                     shard_of(canon, bits.p),
