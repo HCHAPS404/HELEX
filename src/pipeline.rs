@@ -30,8 +30,9 @@ use crate::pq::{self, Col, Writer as PqWriter};
 use crate::sso::SmallBytes;
 use crate::timestamp::parse_ts_padded;
 
-/// Shard counts scale with the input so a dedup shard (~10k records) and a
-/// person partition (~40k records) stay L2-sized.
+/// Shard counts scale with the input. Fewer, larger dedup shards (~40k
+/// records) keep the phase-1 scatter to few write streams, which costs far
+/// less than the larger (prefetched) dedup tables.
 #[derive(Clone, Copy)]
 struct Bits {
     s1: u32,
@@ -49,8 +50,8 @@ impl Bits {
                 .unwrap_or(d)
         };
         Bits {
-            s1: lg(env("HELEX_S1_TARGET", 10_000)).clamp(6, 13),
-            p: lg(env("HELEX_P_TARGET", 40_000)).clamp(4, 11),
+            s1: lg(env("HELEX_S1_TARGET", 40_000)).clamp(6, 13),
+            p: lg(env("HELEX_P_TARGET", 80_000)).clamp(4, 11),
         }
     }
 }
