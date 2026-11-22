@@ -25,7 +25,7 @@ use crate::catalog::Catalog;
 use crate::csv_dialect::parse_price_cents;
 use crate::csv_scan::{for_each_record, Masks};
 use crate::dsu::{csv_paths, load_links, Dsu};
-use crate::keys::{be16_padded, fast_key_bytes, id_key, id_key_padded, is_slow, mix64, shard_of, KeyMap};
+use crate::keys::{fast_key_bytes, id_key, id_key_padded, is_slow, mix64, shard_of, KeyMap};
 use crate::pq::{self, Col, Writer as PqWriter};
 use crate::sso::SmallBytes;
 use crate::timestamp::parse_ts_padded;
@@ -107,6 +107,30 @@ struct EvRec {
     ev: u64,
 }
 
+/// Compact phase-1 event copy (24 B), used for every invalid copy and for
+/// valid non-purchase copies whose `ingest - ts` fits in i32 ms:
+/// * invalid: `user == 0`, `w = ingest`;
+/// * valid:   `w = rel_ms << 32 | (ingest - ts) as u32`.
+/// Everything else goes to the wide `EvRec` list.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Ev24 {
+    key: u64,
+    user: u64,
+    w: u64,
+}
+
+impl Ev24 {
+    #[inline(always)]
+    fn ingest(&self, ws: i64) -> i64 {
+        if self.user == 0 {
+            self.w as i64
+        } else {
+            ws + (self.w >> 32) as i64 + i64::from(self.w as u32 as i32)
+        }
+    }
+}
+
 /// Phase-2 survivor: canonical person key + packed event.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -115,19 +139,18 @@ struct PRec {
     ev: u64,
 }
 
-/// Click resolved to a canonical person. `cid_hi/cid_lo` hold the click id
-/// big-endian zero-padded (exact order for ids <= 16 bytes without NUL);
-/// otherwise `long != 0` and (hi, lo) = (worker, index) into the long-id side
-/// lists.
+/// Click resolved to a canonical person (24 B). `ts` is ms since
+/// `click_min_ts`. `cid` is the click id's key with prefix 'k': `form` 0 =
+/// tag form, 1 = plain form (both order-preserving within the form), 2 =
+/// long id stored in the per-worker side lists (`cid` = worker << 40 | idx).
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct CkRec {
     canon: u64,
-    ts: i64,
-    cid_hi: u64,
-    cid_lo: u64,
-    camp: u32,
-    long: u32,
+    cid: u64,
+    ts: u32,
+    camp: u16,
+    form: u16,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -418,9 +441,10 @@ where
 struct P1 {
     worker: usize,
     bits: Bits,
-    ev: Scatter<EvRec>,
+    ev: Scatter<Ev24>,
+    wide: Vec<EvRec>,
+    slow_seen: KeyMap,
     ck: Scatter<CkRec>,
-    slow_e: Vec<(u64, Box<[u8]>)>,
     slow_u: Vec<(u64, Box<[u8]>)>,
     long_cids: Vec<Box<[u8]>>,
     ck_pend: Vec<CkRec>,
@@ -429,24 +453,29 @@ struct P1 {
     err: Option<io::Error>,
 }
 
+const CID_LONG: u16 = 2;
+const CID_IDX_BITS: u32 = 40;
+
 #[inline]
-fn cid_bytes<'a>(c: &CkRec, longs: &'a [Vec<Box<[u8]>>], tmp: &'a mut [u8; 16]) -> &'a [u8] {
-    if c.long != 0 {
-        return &longs[c.cid_hi as usize][c.cid_lo as usize];
+fn cid_bytes<'a>(c: &CkRec, longs: &'a [Vec<Box<[u8]>>], tmp: &'a mut [u8; 9]) -> &'a [u8] {
+    if c.form == CID_LONG {
+        return &longs[(c.cid >> CID_IDX_BITS) as usize]
+            [(c.cid & ((1u64 << CID_IDX_BITS) - 1)) as usize];
     }
-    tmp[..8].copy_from_slice(&c.cid_hi.to_be_bytes());
-    tmp[8..].copy_from_slice(&c.cid_lo.to_be_bytes());
-    let n = 16 - tmp.iter().rev().take_while(|&&x| x == 0).count();
+    let n = fast_key_bytes(c.cid, b'k', tmp);
     &tmp[..n]
 }
 
+/// Byte-wise click-id order.
 #[inline]
 fn cid_cmp(a: &CkRec, b: &CkRec, longs: &[Vec<Box<[u8]>>]) -> Ordering {
-    if (a.long | b.long) == 0 {
-        (a.cid_hi, a.cid_lo).cmp(&(b.cid_hi, b.cid_lo))
+    if a.form == b.form && a.form != CID_LONG {
+        // same fast form: zero-padded big-endian payloads (no NULs) order
+        // like the bytes; tag-form ids share the 'k' prefix.
+        (a.cid & !crate::keys::TAG).cmp(&(b.cid & !crate::keys::TAG))
     } else {
-        let mut ta = [0u8; 16];
-        let mut tb = [0u8; 16];
+        let mut ta = [0u8; 9];
+        let mut tb = [0u8; 9];
         cid_bytes(a, longs, &mut ta).cmp(cid_bytes(b, longs, &mut tb))
     }
 }
@@ -477,6 +506,7 @@ struct P3 {
 struct Ctx<'a> {
     catalog: &'a Catalog,
     ws: i64,
+    click_base: i64,
     day0: i32,
     num_days: usize,
     longs: &'a [Vec<Box<[u8]>>],
@@ -621,7 +651,8 @@ fn process_person(st: &mut P3, ctx: &Ctx, canon: u64, evs: &mut [u64], clicks: &
         day_events += sess_events;
         day_rev += sess_rev;
 
-        while right < clicks.len() && clicks[right].ts <= sess_start {
+        let sess_rel = sess_start - ctx.click_base;
+        while right < clicks.len() && i64::from(clicks[right].ts) <= sess_rel {
             let cid = clicks[right].camp as usize;
             if !st.in_active[cid] {
                 st.in_active[cid] = true;
@@ -631,7 +662,7 @@ fn process_person(st: &mut P3, ctx: &Ctx, canon: u64, evs: &mut [u64], clicks: &
             right += 1;
         }
         let min_click_ts = sess_start - CLICK_REACH_MS;
-        while left < right && clicks[left].ts < min_click_ts {
+        while left < right && i64::from(clicks[left].ts) < min_click_ts - ctx.click_base {
             st.camp_counts[clicks[left].camp as usize] -= 1;
             left += 1;
         }
@@ -759,11 +790,10 @@ fn process_partition(st: &mut P3, ctx: &Ctx, pblocks: &[&[Blk<PRec>]], cblocks: 
     }
     let zero = CkRec {
         canon: 0,
+        cid: 0,
         ts: 0,
-        cid_hi: 0,
-        cid_lo: 0,
         camp: 0,
-        long: 0,
+        form: 0,
     };
     st.cks.clear();
     st.cks.resize(nck, zero);
@@ -870,30 +900,55 @@ fn parse_event_line(st: &mut P1, fields: &[&[u8]; 7], pc: &PCtx, arena: &Arena) 
     let Some(ingest) = (unsafe { parse_ts_padded(fields[3]) }) else {
         return;
     };
-    let (key, slow_id) = unsafe { id_key_padded(event_id, b'e') };
-    if slow_id {
-        st.slow_e.push((key, event_id.into()));
-    }
-    let (user, ev) = match validate_event_copy(fields, ingest, pc) {
+    // Slow (long) event ids need no bytes: equality on the 56-bit hash key.
+    let (key, _slow_id) = unsafe { id_key_padded(event_id, b'e') };
+    let shard = shard_of(key, st.bits.s1);
+    match validate_event_copy(fields, ingest, pc) {
         Some(ev) => {
             let (uk, slow_u) = unsafe { id_key_padded(fields[1], b'u') };
             if slow_u {
-                st.slow_u.push((uk, fields[1].into()));
+                note_slow_user(st, uk, fields[1]);
             }
-            (uk, ev)
+            let rel = ev >> 32;
+            let delta = ingest - (pc.catalog.window_start + rel as i64);
+            if ev as u32 == 0 && delta >= i64::from(i32::MIN) && delta <= i64::from(i32::MAX) {
+                st.ev.push(
+                    arena,
+                    shard,
+                    Ev24 {
+                        key,
+                        user: uk,
+                        w: (rel << 32) | u64::from(delta as i32 as u32),
+                    },
+                );
+            } else {
+                st.wide.push(EvRec {
+                    key,
+                    ingest,
+                    user: uk,
+                    ev,
+                });
+            }
         }
-        None => (0, 0),
-    };
-    st.ev.push(
-        arena,
-        shard_of(key, st.bits.s1),
-        EvRec {
-            key,
-            ingest,
-            user,
-            ev,
-        },
-    );
+        None => st.ev.push(
+            arena,
+            shard,
+            Ev24 {
+                key,
+                user: 0,
+                w: ingest as u64,
+            },
+        ),
+    }
+}
+
+/// Records a slow user id's bytes once per worker.
+#[cold]
+fn note_slow_user(st: &mut P1, uk: u64, raw: &[u8]) {
+    let (_, ins) = st.slow_seen.get_or_insert(uk, 0);
+    if ins {
+        st.slow_u.push((uk, raw.into()));
+    }
 }
 
 #[inline(always)]
@@ -923,25 +978,27 @@ fn parse_click_line(
     }
     let (uk, slow_u) = unsafe { id_key_padded(user_raw, b'u') };
     if slow_u {
-        st.slow_u.push((uk, user_raw.into()));
+        note_slow_user(st, uk, user_raw);
     }
-    let (cid_hi, cid_lo, long) = if click_id.len() <= 16 && memchr::memchr(0, click_id).is_none() {
-        let (hi, lo) = unsafe { be16_padded(click_id) };
-        (hi, lo, 0u32)
+    let (ck, slow_c) = unsafe { id_key_padded(click_id, b'k') };
+    let (cid, form) = if !slow_c {
+        (ck, u16::from(ck & crate::keys::TAG == 0))
     } else {
         st.long_cids.push(click_id.into());
-        (st.worker as u64, (st.long_cids.len() - 1) as u64, 1u32)
+        (
+            ((st.worker as u64) << CID_IDX_BITS) | (st.long_cids.len() - 1) as u64,
+            CID_LONG,
+        )
     };
     // Linked-ID resolution is a DRAM-latency lookup: queue the click, issue
     // a prefetch, and resolve in batches.
     dsu.prefetch(uk);
     st.ck_pend.push(CkRec {
         canon: uk,
-        ts,
-        cid_hi,
-        cid_lo,
-        camp: u32::from(camp),
-        long,
+        cid,
+        ts: (ts - click_min_ts) as u32,
+        camp,
+        form,
     });
     if st.ck_pend.len() >= CK_BATCH {
         flush_clicks(st, dsu, arena);
@@ -974,7 +1031,7 @@ pub fn run_pipeline(
             "category count exceeds packed-event capacity",
         ));
     }
-    if catalog.window_end - catalog.window_start > i64::from(u32::MAX) {
+    if catalog.window_end - (catalog.window_start - CLICK_REACH_MS) > i64::from(u32::MAX) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "window exceeds packed-event capacity",
@@ -1115,8 +1172,9 @@ pub fn run_pipeline(
                 worker: w,
                 bits,
                 ev: Scatter::new(1 << bits.s1),
+                wide: Vec::new(),
+                slow_seen: KeyMap::with_capacity(16),
                 ck: Scatter::new(1 << bits.p),
-                slow_e: Vec::new(),
                 slow_u: Vec::new(),
                 long_cids: Vec::new(),
                 ck_pend: Vec::with_capacity(CK_BATCH),
@@ -1180,10 +1238,10 @@ pub fn run_pipeline(
     });
     let t_p1end = Instant::now();
     let dsu = dsu_cell.into_inner().unwrap()?;
-    let mut ev_blocks: Vec<Vec<Vec<Blk<EvRec>>>> = Vec::with_capacity(threads);
+    let mut ev_blocks: Vec<Vec<Vec<Blk<Ev24>>>> = Vec::with_capacity(threads);
+    let mut wides: Vec<Vec<EvRec>> = Vec::with_capacity(threads);
     let mut ck_blocks: Vec<Vec<Vec<Blk<CkRec>>>> = Vec::with_capacity(threads);
     let mut longs: Vec<Vec<Box<[u8]>>> = Vec::with_capacity(threads);
-    let mut slow_e: Vec<(u64, Box<[u8]>)> = Vec::new();
     let mut slow_u: Vec<(u64, Box<[u8]>)> = Vec::new();
     for mut st in p1_states {
         if let Some(e) = st.err.take() {
@@ -1192,7 +1250,7 @@ pub fn run_pipeline(
         ev_blocks.push(st.ev.finish(&arena));
         ck_blocks.push(st.ck.finish(&arena));
         longs.push(std::mem::take(&mut st.long_cids));
-        slow_e.append(&mut st.slow_e);
+        wides.push(std::mem::take(&mut st.wide));
         slow_u.append(&mut st.slow_u);
     }
     let t_parse = t1.elapsed();
@@ -1216,19 +1274,43 @@ pub fn run_pipeline(
                 bytes.push(b);
             }
         }
-        slow_e.sort_unstable();
-        slow_e.dedup();
-        if slow_e.windows(2).any(|w| w[0].0 == w[1].0) {
-            eprintln!("[warn] slow event id hash collision");
-        }
         (names, bytes)
     };
 
+    // Wide records (purchases, out-of-range ingest deltas): counting-sort by
+    // dedup shard.
+    let ns1 = 1usize << bits.s1;
+    let mut woff = vec![0usize; ns1 + 1];
+    for w in &wides {
+        for r in w {
+            woff[shard_of(r.key, bits.s1) + 1] += 1;
+        }
+    }
+    for i in 0..ns1 {
+        woff[i + 1] += woff[i];
+    }
+    let mut wide_all: Vec<EvRec> = Vec::with_capacity(woff[ns1]);
+    {
+        let mut cur = woff.clone();
+        let dst = wide_all.as_mut_ptr();
+        for w in &wides {
+            for r in w {
+                let sh = shard_of(r.key, bits.s1);
+                unsafe { dst.add(cur[sh]).write(*r) };
+                cur[sh] += 1;
+            }
+        }
+        unsafe { wide_all.set_len(woff[ns1]) };
+    }
+    drop(wides);
     let t_reg = t_reg0.elapsed();
     // ---- phase 2: dedup per event-id shard
     let t2 = Instant::now();
     let dsu_r = &dsu;
     let evb = &ev_blocks;
+    let woff_r = &woff;
+    // shards own disjoint ranges of wide_all; losers are retired in place
+    let wide_ptr = wide_all.as_mut_ptr() as usize;
     struct P2 {
         out: Scatter<PRec>,
         // interleaved [key, record address] slots; key 0 = empty
@@ -1242,10 +1324,12 @@ pub fn run_pipeline(
             tab: Vec::new(),
         },
         |st, s| {
+            let n_wide = woff_r[s + 1] - woff_r[s];
             let n: usize = evb
                 .iter()
                 .map(|w| w[s].iter().map(|b| b.n as usize).sum::<usize>())
-                .sum();
+                .sum::<usize>()
+                + n_wide;
             if n == 0 {
                 return;
             }
@@ -1257,6 +1341,46 @@ pub fn run_pipeline(
             }
             let mask = cap - 1;
             let tab = &mut st.tab[..cap];
+            let tab_base = tab.as_ptr() as usize;
+            // Table value: record address; low bit set = wide EvRec.
+            let ingest_of = |a: u64| -> i64 {
+                unsafe {
+                    if a & 1 == 0 {
+                        (*(a as *const Ev24)).ingest(ws)
+                    } else {
+                        (*((a & !1) as *const EvRec)).ingest
+                    }
+                }
+            };
+            let retire = |a: u64| unsafe {
+                if a & 1 == 0 {
+                    (*(a as *mut Ev24)).user = 0;
+                } else {
+                    (*((a & !1) as *mut EvRec)).user = 0;
+                }
+            };
+            let mut insert = |k: u64, ingest: i64, addr: u64| {
+                let mut j = (mix64(k) as usize) & mask;
+                loop {
+                    let e = unsafe { tab.get_unchecked_mut(j) };
+                    if e[0] == 0 {
+                        *e = [k, addr];
+                        return;
+                    }
+                    if e[0] == k {
+                        // Duplicate: the loser is retired in place (user = 0),
+                        // so the emit pass needs no probe.
+                        if ingest < ingest_of(e[1]) {
+                            retire(e[1]);
+                            e[1] = addr;
+                        } else {
+                            retire(addr);
+                        }
+                        return;
+                    }
+                    j = (j + 1) & mask;
+                }
+            };
             for w in evb.iter() {
                 for b in w[s].iter() {
                     // Raw pointers: losers are written in place (user = 0).
@@ -1266,42 +1390,25 @@ pub fn run_pipeline(
                         #[cfg(target_arch = "x86_64")]
                         if i + 8 < nrec {
                             let nk = unsafe { (*base.add(i + 8)).key };
-                            let slot = (mix64(nk) as usize) & mask;
                             unsafe {
                                 core::arch::x86_64::_mm_prefetch(
-                                    tab.as_ptr().add(slot) as *const i8,
+                                    (tab_base as *const [u64; 2]).add((mix64(nk) as usize) & mask)
+                                        as *const i8,
                                     core::arch::x86_64::_MM_HINT_T0,
                                 );
                             }
                         }
                         let rp = unsafe { base.add(i) };
-                        let (k, ingest) = unsafe { ((*rp).key, (*rp).ingest) };
-                        let addr = rp as u64;
-                        let mut j = (mix64(k) as usize) & mask;
-                        loop {
-                            let e = unsafe { tab.get_unchecked_mut(j) };
-                            if e[0] == 0 {
-                                *e = [k, addr];
-                                break;
-                            }
-                            if e[0] == k {
-                                // Duplicate: the loser is retired in place
-                                // (user = 0), so the emit pass needs no probe.
-                                let cur = e[1] as *mut EvRec;
-                                unsafe {
-                                    if ingest < (*cur).ingest {
-                                        (*cur).user = 0;
-                                        e[1] = addr;
-                                    } else {
-                                        (*rp).user = 0;
-                                    }
-                                }
-                                break;
-                            }
-                            j = (j + 1) & mask;
-                        }
+                        let (k, ingest) = unsafe { ((*rp).key, (*rp).ingest(ws)) };
+                        insert(k, ingest, rp as u64);
                     }
                 }
+            }
+            let wbase = (wide_ptr as *mut EvRec).wrapping_add(woff_r[s]);
+            for i in 0..n_wide {
+                let rp = unsafe { wbase.add(i) };
+                let (k, ingest) = unsafe { ((*rp).key, (*rp).ingest) };
+                insert(k, ingest, rp as u64 | 1);
             }
             // Winner emit: losers were retired during insert, so every record
             // still carrying a user is a valid winner.
@@ -1321,10 +1428,25 @@ pub fn run_pipeline(
                         st.out.push(
                             arena_ref,
                             shard_of(canon, bits.p),
-                            PRec { canon, ev: r.ev },
+                            PRec {
+                                canon,
+                                ev: r.w & 0xFFFF_FFFF_0000_0000,
+                            },
                         );
                     }
                 }
+            }
+            for i in 0..n_wide {
+                let r = unsafe { &*wbase.add(i) };
+                if r.user == 0 {
+                    continue;
+                }
+                let canon = dsu_r.resolve(r.user);
+                st.out.push(
+                    arena_ref,
+                    shard_of(canon, bits.p),
+                    PRec { canon, ev: r.ev },
+                );
             }
             arena_ref.release(
                 evb.iter()
@@ -1344,6 +1466,7 @@ pub fn run_pipeline(
     let ctx = Ctx {
         catalog: &catalog,
         ws,
+        click_base: click_min_ts,
         day0,
         num_days,
         longs: &longs,

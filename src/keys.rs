@@ -94,25 +94,6 @@ pub unsafe fn id_key_padded(f: &[u8], prefix: u8) -> (u64, bool) {
     (slow_key(f), true)
 }
 
-/// Big-endian, zero-padded (hi, lo) words of a field of <= 16 bytes, using
-/// wide loads (no byte copies).
-///
-/// # Safety
-/// 16 bytes from `f.as_ptr()` must be readable (padded buffer).
-#[inline(always)]
-pub unsafe fn be16_padded(f: &[u8]) -> (u64, u64) {
-    let n = f.len();
-    debug_assert!(n <= 16);
-    let p = f.as_ptr();
-    let hi = load_le_n(p, n.min(8)).swap_bytes();
-    let lo = if n > 8 {
-        load_le_n(p.add(8), n - 8).swap_bytes()
-    } else {
-        0
-    };
-    (hi, lo)
-}
-
 #[inline]
 pub fn slow_key(f: &[u8]) -> u64 {
     SLOW_TOP | (hash64_bytes(f) & LOW56)
