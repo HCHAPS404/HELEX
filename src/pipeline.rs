@@ -88,6 +88,39 @@ const ID_TAG: u64 = 1 << 63;
 // generator counter (see counters.rs), anything below = side-arena offset.
 const ID_DENSE: u32 = u32::MAX - 1;
 
+// Dense canon_key domain: the canon_key of a generator-decodable canonical
+// id is its counter tagged with DENSE_TAG. The tag embeds a NUL byte at
+// position 1, which field_key can never emit (NUL-containing ids always
+// take the hash64 domain), so dense keys can never collide with byte keys.
+// Carrying the counter makes the canonical id string recoverable via
+// counters::encode_into once per group instead of encoding + field-packing
+// every emitted row.
+const DENSE_TAG: u64 = 0x0F00_0000_0000_0000;
+const DENSE_TAG_MASK: u64 = 0xFFFF_0000_0000_0000;
+
+// Canon -> canon_key, domain-uniform: decodable canons take the tagged
+// counter form so every member of a group emits the same key regardless of
+// the path (dense table, link map, or DSU) that resolved it.
+#[inline]
+fn canon_key_of(canon: &[u8], ukey: Option<u64>) -> (u64, bool) {
+    if let Some(k) = ukey {
+        if let Some(v) = counters::decode(canon, b'u', k, counters::USER_CAP) {
+            return (DENSE_TAG | v, false);
+        }
+    }
+    field_key(canon, b'u')
+}
+
+// Canon partition of a canon_key; dense keys spread by user index.
+#[inline]
+fn canon_part(ck: u64) -> usize {
+    if ck & DENSE_TAG_MASK == DENSE_TAG {
+        (((ck & !DENSE_TAG_MASK) >> counters::ALIAS_BITS) as usize) & (NUM_SHARDS - 1)
+    } else {
+        (ck >> SHARD_SHIFT) as usize
+    }
+}
+
 // Invalid flag lives in bit 0 of the packed ingest field:
 // ingest = (ingest_ms << 1) | invalid — ordering is preserved, so dedup's
 // min-ingest comparisons work on the packed values directly.
@@ -488,16 +521,15 @@ fn dense_canon(
     if a < UALIAS_MAX && (e.mask >> a) & 1 == 1 {
         return e.canon;
     }
+    if e.mask & UDIRTY == 0 {
+        return DENSE_TAG | v;
+    }
     let mut tmp = [0u8; 14];
     let n = counters::encode_into(v, ukey, b'u', &mut tmp);
-    let canon: &[u8] = if e.mask & UDIRTY != 0 {
-        dsu.resolve(&tmp[..n])
-    } else {
-        &tmp[..n]
-    };
-    let (ck, cslow) = field_key(canon, b'u');
+    let canon = dsu.resolve(&tmp[..n]);
+    let (ck, cslow) = canon_key_of(canon, Some(ukey));
     if (cslow || ck == 0) && !side_emit.is_empty() {
-        side_emit[(ck >> SHARD_SHIFT) as usize]
+        side_emit[canon_part(ck)]
             .lock()
             .unwrap()
             .push((ck, SmallBytes::from_slice(canon)));
@@ -548,7 +580,7 @@ fn emit_shard(
                     }
                     ck
                 };
-                let part = (ck >> SHARD_SHIFT) as usize;
+                let part = canon_part(ck);
                 stage[part][stage_n[part] as usize] = Rec16 {
                     canon_key: ck,
                     ev: rec.ev,
@@ -653,7 +685,7 @@ fn build_link_maps(
             let mut vv: Vec<(u64, u64, bool)> = Vec::new();
             for i in lo..hi {
                 let (raw, canon) = dsu.pair_at(i);
-                let (ck, cslow) = field_key(canon, b'u');
+                let (ck, cslow) = canon_key_of(canon, ukey);
                 if let Some(k) = ukey {
                     if let Some(v) =
                         counters::decode(raw, b'u', k, counters::USER_CAP)
@@ -666,7 +698,7 @@ fn build_link_maps(
                 }
                 let (uk, uslow) = field_key(raw, b'u');
                 if cslow || ck == 0 {
-                    ls[(ck >> SHARD_SHIFT) as usize]
+                    ls[canon_part(ck)]
                         .push((ck, SmallBytes::from_slice(canon)));
                 }
                 if !uslow && uk != 0 {
@@ -765,6 +797,7 @@ fn process_partition(
     ws: i64,
     day0: i32,
     num_days: usize,
+    ukey: Option<u64>,
 ) -> (Vec<UserDailyRow>, Vec<(u32, CampDayAgg)>) {
     let n_ev: usize = surv_slices.iter().map(|s| s.len()).sum();
     let mut recs: Vec<Rec16> = Vec::with_capacity(n_ev);
@@ -830,6 +863,16 @@ fn process_partition(
 
         let person = match canon_side.binary_search_by_key(&ck, |e| e.0) {
             Ok(j) => canon_side[j].1.clone(),
+            Err(_) if ck & DENSE_TAG_MASK == DENSE_TAG => {
+                let mut tb = [0u8; 14];
+                let n = counters::encode_into(
+                    ck & !DENSE_TAG_MASK,
+                    ukey.unwrap_or(0),
+                    b'u',
+                    &mut tb,
+                );
+                SmallBytes::from_slice(&tb[..n])
+            }
             Err(_) => SmallBytes::from_slice(key_bytes(
                 ck,
                 b'u',
@@ -1493,10 +1536,10 @@ pub fn run_pipeline(
                             .get(uk)
                             .unwrap_or(uk)
                     } else {
-                        field_key(dsu_ref.resolve(user_raw), b'u').0
+                        canon_key_of(dsu_ref.resolve(user_raw), us_key).0
                     }
                 };
-                parts[(ck >> SHARD_SHIFT) as usize].push(ClickRec {
+                parts[canon_part(ck)].push(ClickRec {
                     canon_key: ck,
                     ts,
                     click_id: SmallBytes::from_slice(click_id),
@@ -1564,6 +1607,7 @@ pub fn run_pipeline(
             ws,
             day0,
             num_days,
+            us_key,
         );
         *part_slots_ref[p].lock().unwrap() = Some(res);
     });
