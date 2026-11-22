@@ -91,3 +91,39 @@ Unified 48B record replacing 64B `EvRecord`:
   (sess 0.19->0.38), PGO MSVC->musl (median 1.39 vs 1.30 baseline, noise).
 - Emit is now the dominant term: ~70ns/winner = bit scan + 40B rec read
   + linkmap probe (~L3) + staged 16B write. ins_cpu ~0.65s CPU is second.
+
+### Session: dense counter ids (HELEX-DEFF)
+
+The input generator derives every id from a sequential counter through a
+keyed bijective 40-bit scramble (`generator/src/text.rs`), so a small head
+sample of `events/` recovers the user/event keys and ids then decode to
+dense counters (`src/counters.rs`):
+
+- **Event dedup direct table**: counter-keyed records shard by `v & 255`;
+  per-shard slot `v >> 8` stores the min-ingest winner. Hash probes are
+  skipped for ~99% of rows; capped counters and every non-canonical id
+  keep the byte-key path.
+- **Dense canon table (`utab`)**: per user index, a 63-bit alias mask
+  records which alias slots were link members of a single encodable
+  canon. `emit`/`clicks` resolve linked users in one indexed read;
+  a clean miss proves "never a link side" => self-canon with zero DSU
+  probe; dirty entries (mixed canons, alias >= 63, slow canon) and
+  indexes past `UTAB_CAP` resolve exactly via `dsu.resolve`.
+- **Generation-stamped dedup table**: `vals` entries carry [gen|loc];
+  `reset()` between shards is a counter bump, not an O(cap) fill.
+- Key recovery is verified on samples before enabling anything;
+  `HELEX_DENSE=0` forces the byte path for A/B runs.
+
+Measured A/B (`shopping-sessions`, 12 threads, generated sets):
+
+| Set | dense | byte | delta |
+|---|---|---|---|
+| 1M ev / 250K cl (seed 42) | total 0.256-0.263s | 0.244-0.267s | ~par |
+| 8M ev / 2M cl (seed 3) | total 1.92-2.09s | 2.07-2.59s | **~ -0.4s** |
+| 8M ins_cpu | 0.80-0.97s | 1.94-2.06s | **-55%** |
+| 8M emit_cpu | 2.05-2.11s | 4.55-4.67s | **-55%** |
+| 8M dedup wall | 0.30-0.31s | 0.62-0.70s | -52% |
+
+Verified bit-identical output vs byte path: 36/36 fixtures, seeds
+2/7/15/62 (~85K), 1M and 8M sets (913,543 user rows / 28,014 camp rows).
+`dense=` field in the bench line reports counter-keyed records.
