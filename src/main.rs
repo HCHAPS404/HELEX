@@ -21,9 +21,18 @@ fn main() {
     let scratch_dir = PathBuf::from(env::var("SCRATCH_DIR").unwrap_or_else(|_| "/scratch".into()));
     let debug_bench = env::var("DEBUG_BENCH").is_ok_and(|v| v == "1");
 
-    if let Err(err) = pipeline::run_pipeline(&data_dir, &out_dir, &scratch_dir, debug_bench) {
-        eprintln!("shopping-sessions error: {err}");
-        std::process::exit(1);
+    // HELEX_REPEAT=n (benchmarking only): run the pipeline n times in one
+    // process so per-phase minimums filter out host noise.
+    let repeat: usize = env::var("HELEX_REPEAT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1)
+        .max(1);
+    for _ in 0..repeat {
+        if let Err(err) = pipeline::run_pipeline(&data_dir, &out_dir, &scratch_dir, debug_bench) {
+            eprintln!("shopping-sessions error: {err}");
+            std::process::exit(1);
+        }
     }
     std::process::exit(0);
 }

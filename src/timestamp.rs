@@ -117,15 +117,44 @@ fn parse_civil_prefix(b: &[u8]) -> Option<i64> {
     Some((days * 86_400 + tod) * 1_000)
 }
 
+/// Per (year, month): (epoch day of the month's day 0, month length; 0 for
+/// invalid months). 2 KiB instead of the 32 KiB per-day table, so it stays
+/// in L1 next to the parse working set.
+const MONTH_TABLE: [(i32, u32); YEAR_SPAN * 16] = {
+    let mut t = [(0i32, 0u32); YEAR_SPAN * 16];
+    let mut y = 0usize;
+    while y < YEAR_SPAN {
+        let mut m = 1usize;
+        while m <= 12 {
+            let year = (BASE_YEAR + y) as i64;
+            let len = match m {
+                1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+                4 | 6 | 9 | 11 => 30,
+                _ => {
+                    if is_leap_year(year) {
+                        29
+                    } else {
+                        28
+                    }
+                }
+            };
+            t[(y << 4) | m] = ((days_from_civil(year, m as i64, 1) - 1) as i32, len);
+            m += 1;
+        }
+        y += 1;
+    }
+    t
+};
+
 #[inline(always)]
 fn days_of(year: u32, month: u32, day: u32) -> Option<i64> {
     let y_off = (year as usize).wrapping_sub(BASE_YEAR);
-    if y_off < YEAR_SPAN && month < 16 && day < 32 {
-        let cached = FAST_EPOCH_DAYS[(y_off << 9) | ((month as usize) << 5) | (day as usize)];
-        if cached == INVALID_DAY {
+    if y_off < YEAR_SPAN && month < 16 {
+        let (base, len) = MONTH_TABLE[(y_off << 4) | month as usize];
+        if day.wrapping_sub(1) >= len {
             return None;
         }
-        Some(i64::from(cached))
+        Some(i64::from(base) + i64::from(day))
     } else {
         if year == 0 {
             return None;
