@@ -26,10 +26,7 @@ use crate::csv_dialect::parse_price_cents;
 use crate::csv_scan::{for_each_record, Masks};
 use crate::dsu::{csv_paths, load_links, Dsu};
 use crate::keys::{be16_padded, fast_key_bytes, id_key, id_key_padded, is_slow, mix64, shard_of, KeyMap};
-use crate::parquet_out::{
-    write_campaign_daily, write_user_daily_part, CampaignDailyRow, UserDailyRow, UserDailyWriter,
-    BATCH_ROWS,
-};
+use crate::pq::{self, Col, Writer as PqWriter};
 use crate::sso::SmallBytes;
 use crate::timestamp::parse_ts_padded;
 
@@ -465,9 +462,9 @@ struct P3 {
     ck_lid: Vec<u32>,
     ck_cnt: Vec<u32>,
     cks: Vec<CkRec>,
-    rows: Vec<UserDailyRow>,
+    ucols: Vec<Col>,
     worker: usize,
-    writer: Option<UserDailyWriter>,
+    writer: Option<PqWriter>,
     rows_written: usize,
     err: Option<io::Error>,
     grid: Vec<CampDayAgg>,
@@ -488,6 +485,21 @@ struct Ctx<'a> {
 }
 
 impl Ctx<'_> {
+    #[inline]
+    fn person_bytes<'b>(&'b self, canon: u64, tmp: &'b mut [u8; 9]) -> &'b [u8] {
+        if is_slow(canon) {
+            let i = self
+                .slow_names
+                .get(canon)
+                .expect("slow id missing from registry");
+            &self.slow_bytes[i as usize]
+        } else {
+            let n = fast_key_bytes(canon, b'u', tmp);
+            &tmp[..n]
+        }
+    }
+
+    #[allow(dead_code)]
     fn person_name(&self, canon: u64) -> SmallBytes {
         if is_slow(canon) {
             let i = self
@@ -559,7 +571,6 @@ fn process_person(st: &mut P3, ctx: &Ctx, canon: u64, evs: &mut [u64], clicks: &
     }
     let clicks = &clicks[..clicks_len];
 
-    let mut person: Option<SmallBytes> = None;
     let mut left = 0usize;
     let mut right = 0usize;
     let mut cur_day: i32 = i32::MIN;
@@ -582,15 +593,7 @@ fn process_person(st: &mut P3, ctx: &Ctx, canon: u64, evs: &mut [u64], clicks: &
             } else {
                 None
             };
-            let name = person.get_or_insert_with(|| ctx.person_name(canon)).clone();
-            st.rows.push(UserDailyRow {
-                user_id: name,
-                day: cur_day,
-                sessions: day_sessions,
-                events: day_events,
-                revenue_cents: day_rev,
-                top_category: tc,
-            });
+            push_row(st, ctx, canon, cur_day, day_sessions, day_events, day_rev, tc);
             day_sessions = 0;
             day_events = 0;
             day_rev = 0;
@@ -668,15 +671,7 @@ fn process_person(st: &mut P3, ctx: &Ctx, canon: u64, evs: &mut [u64], clicks: &
         } else {
             None
         };
-        let name = person.unwrap_or_else(|| ctx.person_name(canon));
-        st.rows.push(UserDailyRow {
-            user_id: name,
-            day: cur_day,
-            sessions: day_sessions,
-            events: day_events,
-            revenue_cents: day_rev,
-            top_category: tc,
-        });
+        push_row(st, ctx, canon, cur_day, day_sessions, day_events, day_rev, tc);
     }
     for &cid in &st.active {
         st.camp_counts[cid as usize] = 0;
@@ -811,12 +806,41 @@ fn process_partition(st: &mut P3, ctx: &Ctx, pblocks: &[&[Blk<PRec>]], cblocks: 
     st.cks = cks;
 }
 
-fn flush_rows(st: &mut P3, dir: &Path, cats: &[Vec<u8>]) {
-    if st.rows.is_empty() || st.err.is_some() {
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn push_row(
+    st: &mut P3,
+    ctx: &Ctx,
+    canon: u64,
+    day: i32,
+    sessions: i64,
+    events: i64,
+    revenue: i64,
+    top: Option<u16>,
+) {
+    let mut tmp = [0u8; 9];
+    let name = ctx.person_bytes(canon, &mut tmp);
+    st.ucols[0].push_bytes(name);
+    st.ucols[1].push_i32(day);
+    st.ucols[2].push_i64(sessions);
+    st.ucols[3].push_i64(events);
+    st.ucols[4].push_i64(revenue);
+    st.ucols[5].push_opt_bytes(top.map(|c| ctx.catalog.categories[c as usize].as_slice()));
+}
+
+const ROW_GROUP: usize = 65_536;
+
+fn flush_rows(st: &mut P3, dir: &Path) {
+    let n = st.ucols[0].n;
+    if n == 0 || st.err.is_some() {
         return;
     }
     if st.writer.is_none() {
-        match UserDailyWriter::create(&dir.join(format!("part-{}.parquet", st.worker)), cats) {
+        match PqWriter::create(
+            &dir.join(format!("part-{}.parquet", st.worker)),
+            "user_daily",
+            &pq::USER_DAILY,
+        ) {
             Ok(w) => st.writer = Some(w),
             Err(e) => {
                 st.err = Some(e);
@@ -825,12 +849,14 @@ fn flush_rows(st: &mut P3, dir: &Path, cats: &[Vec<u8>]) {
         }
     }
     let w = st.writer.as_mut().unwrap();
-    if let Err(e) = w.write_batch(&st.rows) {
+    std::mem::swap(&mut w.cols, &mut st.ucols);
+    let r = w.flush_row_group();
+    std::mem::swap(&mut w.cols, &mut st.ucols);
+    if let Err(e) = r {
         st.err = Some(e);
         return;
     }
-    st.rows_written += st.rows.len();
-    st.rows.clear();
+    st.rows_written += n;
 }
 
 // ------------------------------------------------------------- line parsers
@@ -1322,7 +1348,6 @@ pub fn run_pipeline(
     let user_dir = out_dir.join("user_daily");
     fs::create_dir_all(&user_dir)?;
     let ud = &user_dir;
-    let cats = &catalog.categories;
     let p3_states = par_tasks(
         1 << bits.p,
         threads,
@@ -1335,7 +1360,7 @@ pub fn run_pipeline(
             ck_lid: Vec::new(),
             ck_cnt: Vec::new(),
             cks: Vec::new(),
-            rows: Vec::with_capacity(BATCH_ROWS + 4096),
+            ucols: (0..pq::USER_DAILY.len()).map(|_| Col::default()).collect(),
             worker: w,
             writer: None,
             rows_written: 0,
@@ -1350,8 +1375,8 @@ pub fn run_pipeline(
             let pbl: Vec<&[Blk<PRec>]> = pb.iter().map(|t| t[p].as_slice()).collect();
             let cbl: Vec<&[Blk<CkRec>]> = cb.iter().map(|t| t[p].as_slice()).collect();
             process_partition(st, ctx_r, &pbl, &cbl);
-            if st.rows.len() >= BATCH_ROWS {
-                flush_rows(st, ud, cats);
+            if st.ucols[0].n >= ROW_GROUP {
+                flush_rows(st, ud);
             }
         },
     );
@@ -1373,7 +1398,7 @@ pub fn run_pipeline(
             .into_iter()
             .map(|mut st| {
                 sc.spawn(move || {
-                    flush_rows(&mut st, ud, cats);
+                    flush_rows(&mut st, ud);
                     if let Some(w) = st.writer.take() {
                         if let Err(e) = w.close() {
                             st.err.get_or_insert(e);
@@ -1397,24 +1422,29 @@ pub fn run_pipeline(
         }
     }
     if !any_file {
-        write_user_daily_part(&user_dir.join("part-0.parquet"), &[], &catalog.categories)?;
+        PqWriter::create(&user_dir.join("part-0.parquet"), "user_daily", &pq::USER_DAILY)?
+            .close()?;
     }
-    let mut camp_rows: Vec<CampaignDailyRow> = Vec::new();
+    let camp_dir = out_dir.join("campaign_daily");
+    fs::create_dir_all(&camp_dir)?;
+    let mut cw = PqWriter::create(
+        &camp_dir.join("part-0.parquet"),
+        "campaign_daily",
+        &pq::CAMPAIGN_DAILY,
+    )?;
     for (cell, agg) in grid.iter().enumerate() {
         if agg.sessions > 0 || agg.assisted_sessions > 0 {
             let cid = cell / num_days;
-            camp_rows.push(CampaignDailyRow {
-                campaign_id: catalog.campaign_ids[cid].clone(),
-                channel: catalog.campaign_channels[cid].clone(),
-                day: day0 + (cell % num_days) as i32,
-                sessions: agg.sessions,
-                purchasing_sessions: agg.purchasing_sessions,
-                revenue_cents: agg.revenue_cents,
-                assisted_sessions: agg.assisted_sessions,
-            });
+            cw.cols[0].push_bytes(&catalog.campaign_ids[cid]);
+            cw.cols[1].push_bytes(&catalog.campaign_channels[cid]);
+            cw.cols[2].push_i32(day0 + (cell % num_days) as i32);
+            cw.cols[3].push_i64(agg.sessions);
+            cw.cols[4].push_i64(agg.purchasing_sessions);
+            cw.cols[5].push_i64(agg.revenue_cents);
+            cw.cols[6].push_i64(agg.assisted_sessions);
         }
     }
-    write_campaign_daily(out_dir, &camp_rows)?;
+    let camp_rows_n = cw.close()?;
     let t_out = t4.elapsed();
 
     eprintln!(
@@ -1428,7 +1458,7 @@ pub fn run_pipeline(
         t_out.as_secs_f64(),
         t0.elapsed().as_secs_f64(),
         total_user_rows,
-        camp_rows.len()
+        camp_rows_n
     );
     std::mem::forget(ev_blocks);
     std::mem::forget(ck_blocks);

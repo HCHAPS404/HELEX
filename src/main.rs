@@ -4,7 +4,7 @@ mod csv_dialect;
 mod csv_scan;
 mod dsu;
 mod keys;
-mod parquet_out;
+mod pq;
 mod pipeline;
 mod sso;
 mod timestamp;
