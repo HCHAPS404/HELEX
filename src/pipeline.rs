@@ -934,6 +934,10 @@ pub fn run_pipeline(
     }
     let ws = catalog.window_start;
     let we = catalog.window_end;
+    crate::timestamp::install_ts_ctx(
+        (ws - 8 * DAY_MS).div_euclid(DAY_MS),
+        (we + 6 * DAY_MS).div_euclid(DAY_MS),
+    );
     let day0 = ws.div_euclid(DAY_MS) as i32;
     let num_days = ((we - 1).div_euclid(DAY_MS) as i32 - day0) as usize + 1;
     let click_min_ts = ws - CLICK_REACH_MS;

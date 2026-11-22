@@ -39,6 +39,68 @@ const BASE_YEAR: usize = 2020;
 const YEAR_SPAN: usize = 16;
 const INVALID_DAY: i32 = i32::MIN;
 
+/// Howard Hinnant's civil_from_days: epoch day -> (year, month, day).
+#[inline]
+pub const fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let shifted = z + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let doe = shifted - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (yoe + era * 400 + (m <= 2) as i64, m, d)
+}
+
+/// Cached `YYYY-MM-` prefixes (u64 little-endian loads) covering the window
+/// plus margins, each with a `day -> epoch day` table (INVALID_DAY = bad day).
+pub struct TsCtx {
+    pub ym: [u64; 3],
+    pub days: [[i32; 32]; 3],
+    pub n: usize,
+}
+
+static TS_CTX: std::sync::OnceLock<TsCtx> = std::sync::OnceLock::new();
+
+/// Installs the F1 prefix cache for `day_lo..=day_hi` (epoch days). At most
+/// three distinct `YYYY-MM` can appear in any <= 45 day span.
+pub fn install_ts_ctx(day_lo: i64, day_hi: i64) {
+    let _ = TS_CTX.set({
+        let mut ctx = TsCtx {
+            ym: [0; 3],
+            days: [[INVALID_DAY; 32]; 3],
+            n: 0,
+        };
+        let (mut y, mut m, _) = civil_from_days(day_lo);
+        while ctx.n < 3 && days_from_civil(y, m, 1) <= day_hi {
+            let i = ctx.n;
+            ctx.ym[i] = u64::from_le_bytes([
+                b'0' + (y / 1000 % 10) as u8,
+                b'0' + (y / 100 % 10) as u8,
+                b'0' + (y / 10 % 10) as u8,
+                b'0' + (y % 10) as u8,
+                b'-',
+                b'0' + (m / 10) as u8,
+                b'0' + (m % 10) as u8,
+                b'-',
+            ]);
+            for day in 1..32 {
+                if let Some(ed) = validate_and_days(y, m, day) {
+                    ctx.days[i][day as usize] = ed as i32;
+                }
+            }
+            ctx.n += 1;
+            m += 1;
+            if m > 12 {
+                m = 1;
+                y += 1;
+            }
+        }
+        ctx
+    });
+}
+
 const FAST_EPOCH_DAYS: [i32; YEAR_SPAN * 16 * 32] = {
     let mut table = [INVALID_DAY; YEAR_SPAN * 16 * 32];
     let mut y_idx = 0usize;
@@ -233,6 +295,49 @@ unsafe fn digits_val(p: *const u8, n: usize) -> Option<u64> {
 #[inline(always)]
 pub unsafe fn parse_ts_padded(b: &[u8]) -> Option<i64> {
     if b.len() == 20 && *b.get_unchecked(19) == b'Z' {
+        let p = b.as_ptr();
+        if let Some(ctx) = TS_CTX.get() {
+            let w0 = std::ptr::read_unaligned(p as *const u64);
+            let i = if w0 == ctx.ym[0] {
+                0
+            } else if ctx.n > 1 && w0 == ctx.ym[1] {
+                1
+            } else if ctx.n > 2 && w0 == ctx.ym[2] {
+                2
+            } else {
+                usize::MAX
+            };
+            if i != usize::MAX {
+                // Prefix hit: run the same checks parse_civil_swar would.
+                let w1 = std::ptr::read_unaligned(p.add(8) as *const u64);
+                let w2 = u64::from(std::ptr::read_unaligned(p.add(16) as *const u32));
+                const M1: u64 = 0x0000_FF00_00FF_0000;
+                const E1: u64 = 0x0000_3A00_0054_0000;
+                if (w1 & M1) != E1 || (w2 & 0xFF) != 0x3A {
+                    return None;
+                }
+                let d1 = w1 ^ ASCII0;
+                let d2 = w2 ^ (ASCII0 & 0xFFFF_FFFF);
+                const DM1: u64 = 0xFFFF_00FF_FF00_FFFF;
+                const DM2: u64 = 0x0000_0000_00FF_FF00;
+                if !(digits_ok(d1, DM1) && digits_ok(d2, DM2)) {
+                    return None;
+                }
+                let day = byte(d1, 0) * 10 + byte(d1, 1);
+                let hour = byte(d1, 3) * 10 + byte(d1, 4);
+                let minute = byte(d1, 6) * 10 + byte(d1, 7);
+                let second = byte(d2, 1) * 10 + byte(d2, 2);
+                if day > 31 || hour > 23 || minute > 59 || second > 59 {
+                    return None;
+                }
+                let days = ctx.days[i][day as usize];
+                if days == INVALID_DAY {
+                    return None;
+                }
+                let tod = i64::from(hour * 3_600 + minute * 60 + second);
+                return Some((i64::from(days) * 86_400 + tod) * 1_000);
+            }
+        }
         return parse_civil_swar(b.as_ptr());
     }
     let n = b.len();
