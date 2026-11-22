@@ -188,6 +188,7 @@ impl KeyMap {
         (mix64(k) as usize) & self.mask
     }
 
+    #[allow(dead_code)]
     #[inline(always)]
     pub fn prefetch(&self, k: u64) {
         #[cfg(target_arch = "x86_64")]

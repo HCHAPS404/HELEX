@@ -17,7 +17,7 @@ use std::io;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering as AtOrd};
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 use std::time::Instant;
 
 use crate::arena::{Arena, Blk, Scatter};
@@ -1056,11 +1056,14 @@ pub fn run_pipeline(
     };
     let pctx_ref = &pctx;
     let arena = Arena::new();
-    let dsu_cell: OnceLock<io::Result<Dsu>> = OnceLock::new();
+    // Linked IDs build concurrently with event parsing (event chunks come
+    // first in the task order); click chunks wait for it.
+    let dsu_cell: std::sync::OnceLock<io::Result<Dsu>> = std::sync::OnceLock::new();
+    let dsu_cell_ref = &dsu_cell;
+    let dsu_threads = (threads / 4).clamp(1, 2);
     let files_ref = &files;
     let tasks_ref = &tasks;
     let arena_ref = &arena;
-    let dsu_cell_ref = &dsu_cell;
 
     // Readahead: a helper thread asks the kernel to page in input ahead of
     // the parse workers (matters when the page cache is cold); throttled to
@@ -1069,10 +1072,11 @@ pub fn run_pipeline(
     let claimed_ref = &claimed;
     let ra_done = std::sync::atomic::AtomicBool::new(false);
     let ra_done_ref = &ra_done;
+    let t_setup = t1.elapsed();
     let (p1_states, t_dsu) = std::thread::scope(|sc| {
-        let dsu_thread = sc.spawn(|| {
+        let dsu_thread = sc.spawn(move || {
             let t = Instant::now();
-            let _ = dsu_cell_ref.set(load_links(data_dir));
+            let _ = dsu_cell_ref.set(load_links(data_dir, dsu_threads));
             t.elapsed()
         });
         if !std::env::var("HELEX_RA").is_ok_and(|v| v == "0") {
@@ -1142,26 +1146,26 @@ pub fn run_pipeline(
                             }
                             std::thread::yield_now();
                         };
-                        match dsu {
-                            Ok(dsu) => {
-                                let r = run_chunk(f, task.start, task.end, &mut buf, |b, first, limit| {
-                                    for_each_record::<4>(b, first, limit, &mut masks, #[inline(always)] |fields| {
-                                        parse_click_line(
-                                            st,
-                                            fields,
-                                            pctx_ref,
-                                            dsu,
-                                            arena_ref,
-                                            click_min_ts,
-                                            we,
-                                        )
-                                    })
-                                });
-                                flush_clicks(st, dsu, arena_ref);
-                                r
-                            }
-                            Err(_) => Ok(()),
-                        }
+                        let Ok(dsu) = dsu else {
+                            st.buf = buf;
+                            st.masks = masks;
+                            return;
+                        };
+                        let r = run_chunk(f, task.start, task.end, &mut buf, |b, first, limit| {
+                            for_each_record::<4>(b, first, limit, &mut masks, #[inline(always)] |fields| {
+                                parse_click_line(
+                                    st,
+                                    fields,
+                                    pctx_ref,
+                                    dsu,
+                                    arena_ref,
+                                    click_min_ts,
+                                    we,
+                                )
+                            })
+                        });
+                        flush_clicks(st, dsu, arena_ref);
+                        r
                     }
                 };
                 st.buf = buf;
@@ -1174,6 +1178,7 @@ pub fn run_pipeline(
         ra_done_ref.store(true, AtOrd::Relaxed);
         (states, dsu_thread.join().unwrap())
     });
+    let t_p1end = Instant::now();
     let dsu = dsu_cell.into_inner().unwrap()?;
     let mut ev_blocks: Vec<Vec<Vec<Blk<EvRec>>>> = Vec::with_capacity(threads);
     let mut ck_blocks: Vec<Vec<Vec<Blk<CkRec>>>> = Vec::with_capacity(threads);
@@ -1191,6 +1196,8 @@ pub fn run_pipeline(
         slow_u.append(&mut st.slow_u);
     }
     let t_parse = t1.elapsed();
+    let t_tail = t_p1end.elapsed();
+    let t_reg0 = Instant::now();
 
     // Slow-id registries (rare): bytes for output + 56-bit hash collision check.
     let (slow_names, slow_bytes) = {
@@ -1217,6 +1224,7 @@ pub fn run_pipeline(
         (names, bytes)
     };
 
+    let t_reg = t_reg0.elapsed();
     // ---- phase 2: dedup per event-id shard
     let t2 = Instant::now();
     let dsu_r = &dsu;
@@ -1459,8 +1467,11 @@ pub fn run_pipeline(
         .unwrap_or(0)
         / 1024;
     eprintln!(
-        "[bench] anon_mb={} threads={} cat={:.3}s dsu={:.3}s parse={:.3}s dedup={:.3}s sess={:.3}s out={:.3}s total={:.3}s user_rows={} camp_rows={}",
+        "[bench] anon_mb={} setup={:.3}s p1tail={:.3}s reg={:.3}s threads={} cat={:.3}s dsu={:.3}s parse={:.3}s dedup={:.3}s sess={:.3}s out={:.3}s total={:.3}s user_rows={} camp_rows={}",
         anon_mb,
+        t_setup.as_secs_f64(),
+        t_tail.as_secs_f64(),
+        t_reg.as_secs_f64(),
         threads,
         t_cat.as_secs_f64(),
         t_dsu.as_secs_f64(),
