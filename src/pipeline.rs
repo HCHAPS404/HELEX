@@ -818,7 +818,7 @@ fn flush_rows(st: &mut P3, dir: &Path, cats: &[Vec<u8>]) {
 // ------------------------------------------------------------- line parsers
 
 #[inline(always)]
-fn parse_event_line(st: &mut P1, fields: &[&[u8]; 7], pc: &PCtx, arena: &Arena, lv: usize) {
+fn parse_event_line(st: &mut P1, fields: &[&[u8]; 7], pc: &PCtx, arena: &Arena) {
     let event_id = fields[0];
     if event_id.is_empty() {
         return;
@@ -840,18 +840,16 @@ fn parse_event_line(st: &mut P1, fields: &[&[u8]; 7], pc: &PCtx, arena: &Arena, 
         }
         None => (0, 0),
     };
-    if lv >= 4 {
-        st.ev.push(
-            arena,
-            shard_of(key, st.bits.s1),
-            EvRec {
-                key,
-                ingest,
-                user,
-                ev,
-            },
-        );
-    }
+    st.ev.push(
+        arena,
+        shard_of(key, st.bits.s1),
+        EvRec {
+            key,
+            ingest,
+            user,
+            ev,
+        },
+    );
 }
 
 #[inline(always)]
@@ -1006,10 +1004,6 @@ pub fn run_pipeline(
         camp,
     };
     let pctx_ref = &pctx;
-    let lv: usize = std::env::var("HELEX_PL")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(5);
     let arena = Arena::new();
     let dsu_cell: OnceLock<io::Result<Dsu>> = OnceLock::new();
     let files_ref = &files;
@@ -1048,8 +1042,8 @@ pub fn run_pipeline(
                 let mut masks = std::mem::take(&mut st.masks);
                 let res = match f.kind {
                     Kind::Events => run_chunk(f, task.start, task.end, &mut buf, |b, first, limit| {
-                        for_each_record::<7>(b, first, limit, &mut masks, lv, |fields| {
-                            parse_event_line(st, fields, pctx_ref, arena_ref, lv)
+                        for_each_record::<7>(b, first, limit, &mut masks, |fields| {
+                            parse_event_line(st, fields, pctx_ref, arena_ref)
                         })
                     }),
                     Kind::Clicks => {
@@ -1061,7 +1055,7 @@ pub fn run_pipeline(
                         };
                         match dsu {
                             Ok(dsu) => run_chunk(f, task.start, task.end, &mut buf, |b, first, limit| {
-                                for_each_record::<4>(b, first, limit, &mut masks, lv, |fields| {
+                                for_each_record::<4>(b, first, limit, &mut masks, |fields| {
                                     parse_click_line(
                                         st,
                                         fields,

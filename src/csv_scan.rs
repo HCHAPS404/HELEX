@@ -55,36 +55,9 @@ fn build_scalar_from(b: &[u8], from_word: usize, nl: &mut [u64], comma: &mut [u6
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512bw,avx512f")]
-unsafe fn build_avx512(b: &[u8], nl: &mut [u64], comma: &mut [u64], quote: &mut [u64]) {
-    use std::arch::x86_64::*;
-    let vn = _mm512_set1_epi8(b'\n' as i8);
-    let vc = _mm512_set1_epi8(b',' as i8);
-    let vq = _mm512_set1_epi8(b'"' as i8);
-    let full = b.len() / 64;
-    let p = b.as_ptr();
-    for w in 0..full {
-        let a = _mm512_loadu_si512(p.add(w * 64) as *const _);
-        *nl.get_unchecked_mut(w) = _mm512_cmpeq_epi8_mask(a, vn);
-        *comma.get_unchecked_mut(w) = _mm512_cmpeq_epi8_mask(a, vc);
-        *quote.get_unchecked_mut(w) = _mm512_cmpeq_epi8_mask(a, vq);
-    }
-    build_scalar_from(b, full, nl, comma, quote);
-}
-
-#[cfg(target_arch = "x86_64")]
 fn has_avx2() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| std::arch::is_x86_feature_detected!("avx2"))
-}
-
-#[cfg(target_arch = "x86_64")]
-fn has_avx512() -> bool {
-    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| {
-        std::arch::is_x86_feature_detected!("avx512bw")
-            && std::arch::is_x86_feature_detected!("avx512vl")
-    })
 }
 
 impl Masks {
@@ -100,11 +73,6 @@ impl Masks {
             self.nl[k] = 0;
             self.comma[k] = 0;
             self.quote[k] = 0;
-        }
-        #[cfg(target_arch = "x86_64")]
-        if has_avx512() {
-            unsafe { build_avx512(b, &mut self.nl, &mut self.comma, &mut self.quote) };
-            return;
         }
         #[cfg(target_arch = "x86_64")]
         if has_avx2() {
@@ -195,7 +163,6 @@ pub fn for_each_record<const N: usize>(
     first: bool,
     limit: usize,
     masks: &mut Masks,
-    lv: usize,
     mut f: impl FnMut(&[&[u8]; N]),
 ) {
     masks.build(b);
@@ -235,10 +202,6 @@ pub fn for_each_record<const N: usize>(
         };
         let len = end - pos;
         let line = unsafe { b.get_unchecked(pos..end) };
-        if lv < 2 {
-            pos = end + 1;
-            continue;
-        }
         if len < 128 {
             let lmask: u128 = (1u128 << len) - 1;
             let q = window128(quote, pos) & lmask;
@@ -254,20 +217,14 @@ pub fn for_each_record<const N: usize>(
                         s = p + 1;
                     }
                     fields[N - 1] = unsafe { line.get_unchecked(s..) };
-                    if lv >= 3 {
-                        f(&fields);
-                    }
-                }
-            } else if let Some(fields) = split_fields_csv::<N>(line) {
-                if lv >= 3 {
                     f(&fields);
                 }
+            } else if let Some(fields) = split_fields_csv::<N>(line) {
+                f(&fields);
             }
         } else if any_in(quote, pos, end) {
             if let Some(fields) = split_fields_csv::<N>(line) {
-                if lv >= 3 {
-                    f(&fields);
-                }
+                f(&fields);
             }
         } else {
             let mut cpos = [0usize; N];
@@ -288,9 +245,7 @@ pub fn for_each_record<const N: usize>(
                     s = cpos[i] + 1;
                 }
                 fields[N - 1] = unsafe { b.get_unchecked(s..end) };
-                if lv >= 3 {
-                    f(&fields);
-                }
+                f(&fields);
             }
         }
         pos = end + 1;
@@ -352,7 +307,7 @@ mod tests {
         for first in [true, false] {
             for limit in [1usize, 50, 63, 64, 65, 127, 128, 1000, text.len()] {
                 let mut got: Vec<Vec<Vec<u8>>> = Vec::new();
-                for_each_record::<7>(&text, first, limit, &mut m, 5, |f| {
+                for_each_record::<7>(&text, first, limit, &mut m, |f| {
                     got.push(f.iter().map(|x| x.to_vec()).collect())
                 });
                 assert_eq!(got, generic::<7>(&text, first, limit), "first={first} limit={limit}");
