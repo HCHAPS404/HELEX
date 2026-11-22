@@ -194,12 +194,12 @@ fn slab_get(slab: &[u8], off: u32) -> &[u8] {
 pub fn load_links(data_dir: &Path, threads: usize) -> io::Result<Dsu> {
     let paths = csv_paths(&data_dir.join("links"));
     let mut file_bufs: Vec<Vec<u8>> = Vec::with_capacity(paths.len());
-    let mut total_lines = 0usize;
+    let mut _total_lines = 0usize;
     for p in &paths {
         let mut bytes = fs::read(p)?;
         // Padding so fields near EOF stay readable by the wide-load key path.
         bytes.extend_from_slice(&[0; PAD_END]);
-        total_lines += memchr::memchr_iter(b'\n', &bytes).count();
+        _total_lines += memchr::memchr_iter(b'\n', &bytes).count();
         file_bufs.push(bytes);
     }
 

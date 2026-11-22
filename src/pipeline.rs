@@ -407,8 +407,8 @@ struct P1 {
     ev: Scatter<EvRec>,
     ck: Scatter<CkRec>,
     // Slow ids: (key, slab offset) pairs; slab entries are [len][bytes].
-    slow_e: Vec<(u64, u32)>,
     slow_u: Vec<(u64, u32)>,
+    slow_seen: KeyMap,
     slab: Vec<u8>,
     long_cids: Vec<Box<[u8]>>,
     buf: Vec<u8>,
@@ -842,14 +842,11 @@ fn parse_event_line(st: &mut P1, fields: &[&[u8]; 7], pc: &PCtx, arena: &Arena) 
     let Some(ingest) = (unsafe { parse_ts_padded(fields[3]) }) else {
         return;
     };
-    let (key, slow_id) = unsafe { id_key_padded(event_id, b'e') };
-    if slow_id {
-        push_slow(&mut st.slow_e, &mut st.slab, key, event_id);
-    }
+    let (key, _) = unsafe { id_key_padded(event_id, b'e') };
     let (user, ev) = match validate_event_copy(fields, ingest, pc) {
         Some(ev) => {
             let (uk, slow_u) = unsafe { id_key_padded(fields[1], b'u') };
-            if slow_u {
+            if slow_u && st.slow_seen.get_or_insert(uk, 0).1 {
                 push_slow(&mut st.slow_u, &mut st.slab, uk, fields[1]);
             }
             (uk, ev)
@@ -894,7 +891,7 @@ fn parse_click_line(
         return;
     }
     let (uk, slow_u) = unsafe { id_key_padded(user_raw, b'u') };
-    if slow_u {
+    if slow_u && st.slow_seen.get_or_insert(uk, 0).1 {
         push_slow(&mut st.slow_u, &mut st.slab, uk, user_raw);
     }
     let canon = dsu.resolve(uk);
@@ -1045,8 +1042,8 @@ pub fn run_pipeline(
                 bits,
                 ev: Scatter::new(1 << bits.s1),
                 ck: Scatter::new(1 << bits.p),
-                slow_e: Vec::new(),
                 slow_u: Vec::new(),
+                slow_seen: KeyMap::with_capacity(1024),
                 slab: Vec::new(),
                 long_cids: Vec::new(),
                 buf: Vec::with_capacity((chunk + TAIL) as usize + PAD),
@@ -1105,7 +1102,6 @@ pub fn run_pipeline(
     let mut ev_blocks: Vec<Vec<Vec<Blk<EvRec>>>> = Vec::with_capacity(threads);
     let mut ck_blocks: Vec<Vec<Vec<Blk<CkRec>>>> = Vec::with_capacity(threads);
     let mut longs: Vec<Vec<Box<[u8]>>> = Vec::with_capacity(threads);
-    let mut slow_e: Vec<(u64, u32)> = Vec::new();
     let mut slow_u: Vec<(u64, u32)> = Vec::new();
     let mut slab: Vec<u8> = Vec::new();
     for mut st in p1_states {
@@ -1117,7 +1113,6 @@ pub fn run_pipeline(
         longs.push(std::mem::take(&mut st.long_cids));
         let base = slab.len() as u32;
         slab.extend_from_slice(&st.slab);
-        slow_e.extend(st.slow_e.iter().map(|&(k, o)| (k, o + base)));
         slow_u.extend(st.slow_u.iter().map(|&(k, o)| (k, o + base)));
     }
     let t_parse = t1.elapsed();
@@ -1146,16 +1141,10 @@ pub fn run_pipeline(
                 bytes.push(slab_get(&slab, off).into());
             }
         }
-        slow_e.sort_unstable_by(|a, b| {
-            a.0.cmp(&b.0)
-                .then_with(|| slab_get(&slab, a.1).cmp(slab_get(&slab, b.1)))
-        });
-        slow_e.dedup_by(|a, b| a.0 == b.0 && slab_get(&slab, a.1) == slab_get(&slab, b.1));
-        if slow_e.windows(2).any(|w| w[0].0 == w[1].0) {
-            eprintln!("[warn] slow event id hash collision");
-        }
         (names, bytes)
     };
+
+    let t_reg = t1.elapsed() - t_parse;
 
     // ---- phase 2: dedup per event-id shard
     let t2 = Instant::now();
@@ -1408,11 +1397,12 @@ pub fn run_pipeline(
     let t_out = t4.elapsed();
 
     eprintln!(
-        "[bench] threads={} cat={:.3}s dsu={:.3}s parse={:.3}s dedup={:.3}s sess={:.3}s out={:.3}s total={:.3}s user_rows={} camp_rows={}",
+        "[bench] threads={} cat={:.3}s dsu={:.3}s parse={:.3}s reg={:.3}s dedup={:.3}s sess={:.3}s out={:.3}s total={:.3}s user_rows={} camp_rows={}",
         threads,
         t_cat.as_secs_f64(),
         t_dsu.as_secs_f64(),
         t_parse.as_secs_f64(),
+        t_reg.as_secs_f64(),
         t_dedup.as_secs_f64(),
         t_sess.as_secs_f64(),
         t_out.as_secs_f64(),
