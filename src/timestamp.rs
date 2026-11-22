@@ -189,17 +189,62 @@ unsafe fn parse_civil_swar(p: *const u8) -> Option<i64> {
     Some((days * 86_400 + tod) * 1_000)
 }
 
-/// Same result as [`parse_timestamp`], with a SWAR fast path for F1.
+/// SWAR parse of exactly `n` (1..=8) ASCII digits at `p`.
+/// Returns None on any non-digit byte inside the field.
+///
+/// # Safety
+/// `p..p+8` must be readable.
+#[inline(always)]
+unsafe fn digits8(p: *const u8, n: usize) -> Option<u64> {
+    debug_assert!(n >= 1 && n <= 8);
+    let m = if n >= 8 { !0u64 } else { (1u64 << (n * 8)) - 1 };
+    let v = std::ptr::read_unaligned(p as *const u64) & m;
+    let d = v ^ (ASCII0 & m);
+    if !digits_ok(d, m) {
+        return None;
+    }
+    // Right-justify the digit values: byte j holds the 10^(7-j) digit.
+    let x = if n >= 8 { d } else { d << ((8 - n) * 8) };
+    let x = (x & 0x0F0F_0F0F_0F0F_0F0F).wrapping_mul(2561) >> 8;
+    let x = (x & 0x00FF_00FF_00FF_00FF).wrapping_mul(6_553_601) >> 16;
+    let x = (x & 0x0000_FFFF_0000_FFFF).wrapping_mul(42_949_672_960_001) >> 32;
+    Some(x)
+}
+
+/// All-digit value of `n` (1..=19) bytes at `p`, or None on a non-digit.
+/// n <= 19 digits cannot overflow u64.
+///
+/// # Safety
+/// `p..p+8` and `p+n-8..p+n` must be readable.
+#[inline(always)]
+unsafe fn digits_val(p: *const u8, n: usize) -> Option<u64> {
+    if n <= 8 {
+        return digits8(p, n);
+    }
+    let hi = digits_val(p, n - 8)?;
+    let lo = digits8(p.add(n - 8), 8)?;
+    Some(hi * 100_000_000 + lo)
+}
+
+/// Same result as [`parse_timestamp`], with a SWAR fast path for F1 and F3.
 ///
 /// # Safety
 /// At least 24 bytes from `b.as_ptr()` must be readable (padded buffer).
 #[inline(always)]
 pub unsafe fn parse_ts_padded(b: &[u8]) -> Option<i64> {
     if b.len() == 20 && *b.get_unchecked(19) == b'Z' {
-        parse_civil_swar(b.as_ptr())
-    } else {
-        parse_timestamp(b)
+        return parse_civil_swar(b.as_ptr());
     }
+    let n = b.len();
+    if n >= 1 && n <= 19 && b[0].wrapping_sub(b'0') <= 9 {
+        // F3 candidate: a field this short is only valid as all-digits
+        // (F1 needs 20 bytes, F2 needs 25), so a non-digit means bad.
+        return match digits_val(b.as_ptr(), n) {
+            Some(v) => Some(if v > i64::MAX as u64 { i64::MAX } else { v as i64 }),
+            None => None,
+        };
+    }
+    parse_timestamp(b)
 }
 
 #[inline]

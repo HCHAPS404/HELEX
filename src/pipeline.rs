@@ -1129,8 +1129,11 @@ pub fn run_pipeline(
     let evb = &ev_blocks;
     struct P2 {
         out: Scatter<PRec>,
-        // interleaved [key, record address] slots; key 0 = empty
-        tab: Vec<[u64; 2]>,
+        // interleaved [key, winner ingest, winner index] slots; key 0 = empty
+        tab: Vec<[u64; 3]>,
+        // bit i set => record i of this shard is the current table winner;
+        // emit becomes a sequential bit scan instead of a probe per record.
+        win: Vec<u64>,
     }
     let p2_states = par_tasks(
         1 << bits.s1,
@@ -1138,6 +1141,7 @@ pub fn run_pipeline(
         |_| P2 {
             out: Scatter::new(1 << bits.p),
             tab: Vec::new(),
+            win: Vec::new(),
         },
         |st, s| {
             let n: usize = evb
@@ -1149,18 +1153,26 @@ pub fn run_pipeline(
             }
             let cap = (n * 2).next_power_of_two().max(64);
             if st.tab.len() < cap {
-                st.tab = vec![[0u64; 2]; cap];
+                st.tab = vec![[0u64; 3]; cap];
             } else {
-                st.tab[..cap].fill([0, 0]);
+                st.tab[..cap].fill([0, 0, 0]);
+            }
+            let nw = n.div_ceil(64);
+            if st.win.len() < nw {
+                st.win = vec![0u64; nw];
+            } else {
+                st.win[..nw].fill(0);
             }
             let mask = cap - 1;
             let tab = &mut st.tab[..cap];
+            let win = &mut st.win[..nw];
+            let mut i: u32 = 0;
             for w in evb.iter() {
                 for b in w[s].iter() {
                     let recs = b.as_slice();
-                    for (i, r) in recs.iter().enumerate() {
+                    for (j8, r) in recs.iter().enumerate() {
                         #[cfg(target_arch = "x86_64")]
-                        if let Some(nx) = recs.get(i + 8) {
+                        if let Some(nx) = recs.get(j8 + 8) {
                             let slot = (mix64(nx.key) as usize) & mask;
                             unsafe {
                                 core::arch::x86_64::_mm_prefetch(
@@ -1170,40 +1182,38 @@ pub fn run_pipeline(
                             }
                         }
                         let k = r.key;
-                        let addr = r as *const EvRec as u64;
                         let mut j = (mix64(k) as usize) & mask;
                         loop {
                             let e = unsafe { tab.get_unchecked_mut(j) };
                             if e[0] == 0 {
-                                *e = [k, addr];
+                                *e = [k, r.ingest as u64, i as u64];
+                                win[i as usize >> 6] |= 1u64 << (i & 63);
                                 break;
                             }
                             if e[0] == k {
-                                let cur = unsafe { &*(e[1] as *const EvRec) };
-                                if r.ingest < cur.ingest {
-                                    e[1] = addr;
+                                if r.ingest < e[1] as i64 {
+                                    let old = e[2] as usize;
+                                    win[old >> 6] &= !(1u64 << (old & 63));
+                                    win[i as usize >> 6] |= 1u64 << (i & 63);
+                                    e[1] = r.ingest as u64;
+                                    e[2] = i as u64;
                                 }
                                 break;
                             }
                             j = (j + 1) & mask;
                         }
+                        i += 1;
                     }
                 }
             }
             // Winner emit: sequential re-scan of the records (the table is
-            // cache-resident), instead of random record reads from the table.
+            // cache-resident), guided by the winner bitmap instead of a
+            // table probe per record.
+            let mut i: u32 = 0;
             for w in evb.iter() {
                 for b in w[s].iter() {
                     for r in b.as_slice() {
-                        if r.user == 0 {
-                            continue;
-                        }
-                        let k = r.key;
-                        let mut j = (mix64(k) as usize) & mask;
-                        while unsafe { tab.get_unchecked(j)[0] } != k {
-                            j = (j + 1) & mask;
-                        }
-                        if unsafe { tab.get_unchecked(j)[1] } == r as *const EvRec as u64 {
+                        if (win[i as usize >> 6] >> (i & 63)) & 1 == 1 && r.user != 0 {
                             let canon = dsu_r.resolve(r.user);
                             st.out.push(
                                 arena_ref,
@@ -1211,6 +1221,7 @@ pub fn run_pipeline(
                                 PRec { canon, ev: r.ev },
                             );
                         }
+                        i += 1;
                     }
                 }
             }
