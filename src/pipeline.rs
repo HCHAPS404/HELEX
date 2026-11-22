@@ -1131,7 +1131,7 @@ pub fn run_pipeline(
                 let mut masks = std::mem::take(&mut st.masks);
                 let res = match f.kind {
                     Kind::Events => run_chunk(f, task.start, task.end, &mut buf, |b, first, limit| {
-                        for_each_record::<7>(b, first, limit, &mut masks, |fields| {
+                        for_each_record::<7>(b, first, limit, &mut masks, #[inline(always)] |fields| {
                             parse_event_line(st, fields, pctx_ref, arena_ref)
                         })
                     }),
@@ -1145,7 +1145,7 @@ pub fn run_pipeline(
                         match dsu {
                             Ok(dsu) => {
                                 let r = run_chunk(f, task.start, task.end, &mut buf, |b, first, limit| {
-                                    for_each_record::<4>(b, first, limit, &mut masks, |fields| {
+                                    for_each_record::<4>(b, first, limit, &mut masks, #[inline(always)] |fields| {
                                         parse_click_line(
                                             st,
                                             fields,
