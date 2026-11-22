@@ -5,7 +5,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 RUN rustup target add x86_64-unknown-linux-musl
 
-ENV RUSTFLAGS="-C target-cpu=x86-64-v2 -C target-feature=+crt-static" \
+ENV RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+crt-static" \
     CC_x86_64_unknown_linux_musl="musl-gcc"
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
