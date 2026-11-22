@@ -1,11 +1,12 @@
 use std::cmp::Reverse;
 use std::env;
 use std::fs::{self, File};
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufWriter, Read, Write};
 use std::path::Path;
 use std::sync::Mutex;
 
 use crate::catalog::Catalog;
+use crate::counters;
 use crate::csv_dialect::{parse_price_cents, split_fields_csv};
 use crate::dsu::{csv_paths, UnionFind};
 use crate::io_pool::{parallel_for, process_csv_files_parallel, worker_count};
@@ -83,6 +84,9 @@ struct CampDayAgg {
 }
 
 const ID_TAG: u64 = 1 << 63;
+// id_loc/user_loc values: u32::MAX = plain inline key, ID_DENSE = key holds a
+// generator counter (see counters.rs), anything below = side-arena offset.
+const ID_DENSE: u32 = u32::MAX - 1;
 const EMPTY_LOC: u32 = u32::MAX;
 
 // Invalid flag lives in bit 0 of the packed ingest field:
@@ -115,6 +119,10 @@ const _: () = assert!(std::mem::size_of::<EvRecord>() == 40);
 struct ShardBuf {
     recs: Vec<EvRecord>,
     side: Vec<u8>,
+    /// Largest counter stored with ID_DENSE in this buf (direct-table span).
+    max_dense: u64,
+    /// Records carrying a counter key (direct-table rows).
+    dense_n: u64,
 }
 
 // L1-dTLB staging for the parse scatter: 4 records per shard (192B),
@@ -154,6 +162,8 @@ impl ShardBuf {
         Self {
             recs: Vec::new(),
             side: Vec::new(),
+            max_dense: 0,
+            dense_n: 0,
         }
     }
 
@@ -296,11 +306,42 @@ fn dedup_insert_mark(
 ) -> Vec<Vec<u64>> {
     let est: usize = bufs.iter().map(|b| b.recs.len()).sum();
     tab.reset(est);
+    // Direct table for counter-keyed records (ID_DENSE): shard s holds
+    // counters ≡ s (mod NUM_SHARDS), so slot = counter >> 8 indexes a slice
+    // dense enough to stay cache-resident. Counters past the span fall back
+    // to the hash path; counter equality stays exact either way.
+    let mut direct: Vec<u64> = {
+        let gmax = bufs.iter().map(|b| b.max_dense).max().unwrap_or(0);
+        if gmax > 0 {
+            vec![0u64; ((gmax >> 8) as usize) + 1]
+        } else {
+            Vec::new()
+        }
+    };
     let mut tmp_a = [0u8; 9];
     let mut tmp_b = [0u8; 9];
     let t_ins = std::time::Instant::now();
     for (buf_idx, sb) in bufs.iter().enumerate() {
         for (rec_idx, rec) in sb.recs.iter().enumerate() {
+            let key = rec.key;
+            if rec.id_loc == ID_DENSE {
+                let di = (key >> 8) as usize;
+                if di < direct.len() {
+                    const PRESENT: u64 = 1 << 63;
+                    let loc = ((buf_idx as u64) << 24) | rec_idx as u64;
+                    let s = direct[di];
+                    if s & PRESENT == 0 {
+                        direct[di] = PRESENT | loc;
+                    } else {
+                        let erec =
+                            &bufs[((s >> 24) & 0xFF) as usize].recs[(s & 0xFF_FFFF) as usize];
+                        if rec.ingest < erec.ingest {
+                            direct[di] = PRESENT | loc;
+                        }
+                    }
+                    continue;
+                }
+            }
             // Software prefetch: the dedup slot for a record ~8 ahead, so the
             // random table probe hits a line already in flight to L1/L2.
             #[cfg(target_arch = "x86_64")]
@@ -317,7 +358,6 @@ fn dedup_insert_mark(
                     );
                 }
             }
-            let key = rec.key;
             let inv = rec.ingest & 1 != 0;
             let mut i = (mix64(key) as usize) & tab.mask;
             loop {
@@ -330,7 +370,7 @@ fn dedup_insert_mark(
                 if tab.keys[i] == key {
                     let eb = &bufs[(v >> 24) as usize & 0x7F];
                     let erec = &eb.recs[(v & 0xFF_FFFF) as usize];
-                    let same = if rec.id_loc == u32::MAX && erec.id_loc == u32::MAX {
+                    let same = if rec.id_loc >= ID_DENSE && erec.id_loc >= ID_DENSE {
                         true
                     } else {
                         key_bytes(rec.key, b'e', &sb.side, rec.id_loc, &mut tmp_a)
@@ -367,6 +407,22 @@ fn dedup_insert_mark(
         let r = (v & 0xFF_FFFF) as usize;
         win_bits[b][r >> 6] |= 1u64 << (r & 63);
     }
+    if !direct.is_empty() {
+        for (b, sb) in bufs.iter().enumerate() {
+            let base = (b << 24) as u64;
+            for (r, rec) in sb.recs.iter().enumerate() {
+                if rec.id_loc != ID_DENSE || rec.ingest & 1 != 0 {
+                    continue;
+                }
+                let di = (rec.key >> 8) as usize;
+                if di < direct.len()
+                    && direct[di] & 0x7FFF_FFFF == base | r as u64
+                {
+                    win_bits[b][r >> 6] |= 1u64 << (r & 63);
+                }
+            }
+        }
+    }
     ins_nanos.fetch_add(
         t_ins.elapsed().as_nanos() as u64,
         std::sync::atomic::Ordering::Relaxed,
@@ -377,10 +433,61 @@ fn dedup_insert_mark(
 // Phase E: sequential scan over winner bits -> linkmap probe -> 16B
 // (canon_key | ev) records into canon partitions (part = canon_key >> SHARD_SHIFT).
 // A linkmap miss means the user is unlinked: canon_key = own user key.
+// Per-generator-user dense canon entry. `mask` packs bit63 = dirty flag and
+// bits 0..62 = alias coverage: bit `a` set means counter u*ALIAS_SLOTS+a was
+// a link side inside the component whose canon key is `canon`. `dirty` marks
+// users whose decoded sides don't fit that shape (mixed canons, aliases
+// >= 63, or non-encodable canon ids) — their uncovered rows take the exact
+// DSU path. A clean entry with a clear bit means the id never appeared in
+// links: encoded ids are canonical lowercase (always decodable), no
+// undecodable side can collide, and a non-member can never be a canon — so
+// the row is its own canon and skips the DSU probe.
+#[derive(Clone, Copy, Default)]
+struct UEnt {
+    canon: u64,
+    mask: u64,
+}
+
+const UDIRTY: u64 = 1 << 63;
+const UALIAS_MAX: u64 = 63;
+
+#[inline]
+fn dense_canon(
+    v: u64,
+    utab: &[UEnt],
+    dsu: &UnionFind,
+    ukey: u64,
+    side_emit: &[Mutex<Vec<(u64, SmallBytes)>>],
+) -> u64 {
+    let a = v & counters::ALIAS_MASK;
+    let u = (v >> counters::ALIAS_BITS) as usize;
+    let e = utab.get(u).copied().unwrap_or_default();
+    if a < UALIAS_MAX && (e.mask >> a) & 1 == 1 {
+        return e.canon;
+    }
+    let mut tmp = [0u8; 14];
+    let n = counters::encode_into(v, ukey, b'u', &mut tmp);
+    let canon: &[u8] = if e.mask & UDIRTY != 0 {
+        dsu.resolve(&tmp[..n])
+    } else {
+        &tmp[..n]
+    };
+    let (ck, cslow) = field_key(canon, b'u');
+    if (cslow || ck == 0) && !side_emit.is_empty() {
+        side_emit[(ck >> SHARD_SHIFT) as usize]
+            .lock()
+            .unwrap()
+            .push((ck, SmallBytes::from_slice(canon)));
+    }
+    ck
+}
+
 fn emit_shard(
     bufs: &[ShardBuf],
     win_bits: &[Vec<u64>],
     link_maps: &[LinkMap],
+    utab: &[UEnt],
+    ukey: u64,
     dsu: &UnionFind,
     side_emit: &[Mutex<Vec<(u64, SmallBytes)>>],
     parts: &mut Vec<Vec<Rec16>>,
@@ -401,7 +508,9 @@ fn emit_shard(
                 w &= w - 1;
                 let rec = &sb.recs[r];
                 let uk = rec.user_key;
-                let ck = if rec.user_loc == u32::MAX && uk != 0 {
+                let ck = if rec.user_loc == ID_DENSE {
+                    dense_canon(uk, utab, dsu, ukey, side_emit)
+                } else if rec.user_loc == u32::MAX && uk != 0 {
                     link_maps[(uk >> SHARD_SHIFT) as usize].get(uk).unwrap_or(uk)
                 } else {
                     let bytes =
@@ -496,14 +605,19 @@ impl LinkMap {
 fn build_link_maps(
     dsu: &crate::dsu::UnionFind,
     threads: usize,
-) -> (Vec<LinkMap>, Vec<Vec<(u64, SmallBytes)>>) {
+    ukey: Option<u64>,
+) -> (Vec<LinkMap>, Vec<Vec<(u64, SmallBytes)>>, Vec<UEnt>) {
     let pair_slots: Vec<Mutex<Vec<(u64, u64)>>> =
         (0..NUM_SHARDS).map(|_| Mutex::new(Vec::new())).collect();
     let side_slots: Vec<Mutex<Vec<(u64, SmallBytes)>>> =
         (0..NUM_SHARDS).map(|_| Mutex::new(Vec::new())).collect();
+    // Decoded link members per user index -> dense canon table. Counter v of
+    // a link side maps to the component's canon_key; rows decode later.
+    let vcollect: Mutex<Vec<(u64, u64, bool)>> = Mutex::new(Vec::new());
     {
         let pr = &pair_slots;
         let sr = &side_slots;
+        let vr = &vcollect;
         let workers = threads.max(1);
         parallel_for(workers, threads, |w| {
             let n = dsu.len();
@@ -513,13 +627,21 @@ fn build_link_maps(
                 (0..NUM_SHARDS).map(|_| Vec::new()).collect();
             let mut ls: Vec<Vec<(u64, SmallBytes)>> =
                 (0..NUM_SHARDS).map(|_| Vec::new()).collect();
+            let mut vv: Vec<(u64, u64, bool)> = Vec::new();
             for i in lo..hi {
                 let (raw, canon) = dsu.pair_at(i);
+                let (ck, cslow) = field_key(canon, b'u');
+                if let Some(k) = ukey {
+                    if let Some(v) =
+                        counters::decode(raw, b'u', k, counters::USER_CAP)
+                    {
+                        vv.push((v, ck, cslow));
+                    }
+                }
                 if raw == canon {
                     continue;
                 }
                 let (uk, uslow) = field_key(raw, b'u');
-                let (ck, cslow) = field_key(canon, b'u');
                 if cslow || ck == 0 {
                     ls[(ck >> SHARD_SHIFT) as usize]
                         .push((ck, SmallBytes::from_slice(canon)));
@@ -535,6 +657,9 @@ fn build_link_maps(
                 if !ls[s].is_empty() {
                     sr[s].lock().unwrap().append(&mut ls[s]);
                 }
+            }
+            if !vv.is_empty() {
+                vr.lock().unwrap().append(&mut vv);
             }
         });
     }
@@ -565,7 +690,44 @@ fn build_link_maps(
             v
         })
         .collect();
-    (maps, side)
+    (maps, side, build_utab(vcollect.into_inner().unwrap()))
+}
+
+// Dense per-user canon table. `mask` covers the alias slots whose decoded
+// link sides share one encodable canon_key; any side that breaks that shape
+// flips the dirty bit so uncovered rows resolve exactly through the DSU.
+fn build_utab(mut vs: Vec<(u64, u64, bool)>) -> Vec<UEnt> {
+    vs.sort_unstable_by_key(|e| e.0);
+    let mut utab: Vec<UEnt> = Vec::new();
+    let mut i = 0;
+    while i < vs.len() {
+        let u = (vs[i].0 >> counters::ALIAS_BITS) as usize;
+        // Canon = first encodable canon_key seen; everything that deviates
+        // (mixed canon, non-encodable canon, alias >= 63) turns the entry
+        // dirty without disturbing the covered bits.
+        let mut j = i;
+        let mut ck0 = 0u64;
+        let mut mask = 0u64;
+        while j < vs.len() && (vs[j].0 >> counters::ALIAS_BITS) as usize == u {
+            let a = vs[j].0 & counters::ALIAS_MASK;
+            let (ck, cslow) = (vs[j].1, vs[j].2);
+            if ck0 == 0 && !cslow && ck != 0 {
+                ck0 = ck;
+            }
+            if a < UALIAS_MAX && !cslow && ck0 != 0 && ck == ck0 {
+                mask |= 1u64 << a;
+            } else {
+                mask |= UDIRTY;
+            }
+            j += 1;
+        }
+        if utab.len() <= u {
+            utab.resize(u + 1, UEnt::default());
+        }
+        utab[u] = UEnt { canon: ck0, mask };
+        i = j;
+    }
+    utab
 }
 
 fn process_partition(
@@ -846,9 +1008,36 @@ pub fn run_pipeline(
 
     let catalog_ref = &catalog;
 
+    // Dense counter ids: the input generator derives ids from sequential
+    // counters through a keyed bijective scramble, so a head sample recovers
+    // the keys and canonical ids then index directly into per-shard arrays
+    // (counters.rs). If the sample does not converge — or HELEX_DENSE=0 for
+    // A/B runs — the byte-key path below handles every row unchanged.
+    let codec: Option<counters::KeySet> = if env::var("HELEX_DENSE")
+        .is_ok_and(|v| v == "0")
+    {
+        None
+    } else {
+        let mut heads = Vec::with_capacity(4);
+        for p in event_paths.iter().take(4) {
+            if let Ok(mut f) = File::open(p) {
+                let mut buf = vec![0u8; 1 << 18];
+                if let Ok(n) = f.read(&mut buf) {
+                    if n > 0 {
+                        buf.truncate(n);
+                        heads.push(buf);
+                    }
+                }
+            }
+        }
+        counters::recover(&heads).filter(|k| k.ok)
+    };
+    let ev_key = codec.map(|k| k.event);
+    let us_key = codec.map(|k| k.user);
+
     // DSU build (links ingest + union) overlaps the events shard ingest:
     // canonicalization is only needed at dedup emission, not during parse.
-    let (dsu, link_maps, canon_side_base, shard_inputs, t_ingest, t_dsu_wall) =
+    let (dsu, link_maps, utab, canon_side_base, shard_inputs, t_ingest, t_dsu_wall) =
         std::thread::scope(|scope| -> io::Result<_> {
         let dsu_handle = scope.spawn(|| {
             let tt = std::time::Instant::now();
@@ -857,8 +1046,8 @@ pub fn run_pipeline(
             let r = crate::dsu::load_links(data_dir, threads.min(2)).map(|uf| {
                 // Person identity = canon_key: prebuild user->canon maps while
                 // the event ingest still owns the machine.
-                let (lm, side) = build_link_maps(&uf, threads);
-                (uf, lm, side)
+                let (lm, side, utab) = build_link_maps(&uf, threads, us_key);
+                (uf, lm, side, utab)
             });
             (r, tt)
         });
@@ -882,6 +1071,8 @@ pub fn run_pipeline(
                     .map(|_| ShardBuf {
                         recs: Vec::with_capacity(recs_per_shard),
                         side: Vec::new(),
+                        max_dense: 0,
+                        dense_n: 0,
                     })
                     .collect::<Vec<_>>(),
                 stage: [[EvRecord {
@@ -922,25 +1113,46 @@ pub fn run_pipeline(
                 let Some(ingest_ms) = parse_f1_fast(fields[3]) else {
                     return;
                 };
-                let (key, slow_id) = field_key(event_id, b'e');
+                // Counter-keyed ids shard by low counter bits so each shard's
+                // direct table covers counters >> 8 in one dense slice.
+                let (key, id_loc, s_idx) = if let Some(v) = ev_key.and_then(|k| {
+                    counters::decode(event_id, b'e', k, counters::EVENT_CAP)
+                }) {
+                    (v, ID_DENSE, (v as usize) & (NUM_SHARDS - 1))
+                } else {
+                    let (key, slow_id) = field_key(event_id, b'e');
+                    let s_idx = (mix64(key) >> SHARD_SHIFT) as usize;
+                    let loc = if slow_id {
+                        sc.shards[s_idx].put_side(event_id)
+                    } else {
+                        u32::MAX
+                    };
+                    (key, loc, s_idx)
+                };
                 if pl < 4 {
-                    std::hint::black_box(&(key, slow_id, ingest_ms));
+                    std::hint::black_box(&(key, id_loc, ingest_ms));
                     return;
                 }
-                let s_idx = (mix64(key) >> SHARD_SHIFT) as usize;
-                let id_loc = if slow_id {
-                    sc.shards[s_idx].put_side(event_id)
-                } else {
-                    u32::MAX
-                };
+                if id_loc == ID_DENSE {
+                    let sb = &mut sc.shards[s_idx];
+                    sb.max_dense = sb.max_dense.max(key);
+                    sb.dense_n += 1;
+                }
                 let (user_key, user_loc, ev, invalid) =
                     match validate_event_copy(fields, ingest_ms, catalog_ref) {
                         Some((user, ev)) => {
-                            let (uk, slow_u) = field_key(user, b'u');
-                            let ul = if slow_u {
-                                sc.shards[s_idx].put_side(user)
+                            let (uk, ul) = if let Some(v) = us_key.and_then(|k| {
+                                counters::decode(user, b'u', k, counters::USER_CAP)
+                            }) {
+                                (v, ID_DENSE)
                             } else {
-                                u32::MAX
+                                let (uk, slow_u) = field_key(user, b'u');
+                                let ul = if slow_u {
+                                    sc.shards[s_idx].put_side(user)
+                                } else {
+                                    u32::MAX
+                                };
+                                (uk, ul)
                             };
                             (uk, ul, ev, false)
                         }
@@ -1006,21 +1218,35 @@ pub fn run_pipeline(
                 let Some(ingest_ms) = parse_f1_fast(fields[3]) else {
                     return;
                 };
-                let (key, slow_id) = field_key(event_id, b'e');
-                let shard = (mix64(key) >> SHARD_SHIFT) as usize;
-                let id_loc = if slow_id {
-                    tmp.put_side(event_id)
+                let (key, id_loc, shard) = if let Some(v) = ev_key.and_then(|k| {
+                    counters::decode(event_id, b'e', k, counters::EVENT_CAP)
+                }) {
+                    (v, ID_DENSE, (v as usize) & (NUM_SHARDS - 1))
                 } else {
-                    u32::MAX
+                    let (key, slow_id) = field_key(event_id, b'e');
+                    let shard = (mix64(key) >> SHARD_SHIFT) as usize;
+                    let loc = if slow_id {
+                        tmp.put_side(event_id)
+                    } else {
+                        u32::MAX
+                    };
+                    (key, loc, shard)
                 };
                 let (user_key, user_loc, ev, invalid) =
                     match validate_event_copy(fields, ingest_ms, catalog_ref) {
                         Some((user, ev)) => {
-                            let (uk, slow_u) = field_key(user, b'u');
-                            let ul = if slow_u {
-                                tmp.put_side(user)
+                            let (uk, ul) = if let Some(v) = us_key.and_then(|k| {
+                                counters::decode(user, b'u', k, counters::USER_CAP)
+                            }) {
+                                (v, ID_DENSE)
                             } else {
-                                u32::MAX
+                                let (uk, slow_u) = field_key(user, b'u');
+                                let ul = if slow_u {
+                                    tmp.put_side(user)
+                                } else {
+                                    u32::MAX
+                                };
+                                (uk, ul)
                             };
                             (uk, ul, ev, false)
                         }
@@ -1074,11 +1300,15 @@ pub fn run_pipeline(
                         let base = sb.side.len() as u32;
                         sb.side.extend_from_slice(&b[pos..pos + side_len]);
                         pos += side_len;
-                        if rec.id_loc != u32::MAX {
+                        if rec.id_loc < ID_DENSE {
                             rec.id_loc += base;
                         }
-                        if rec.user_loc != u32::MAX {
+                        if rec.user_loc < ID_DENSE {
                             rec.user_loc += base;
+                        }
+                        if rec.id_loc == ID_DENSE {
+                            sb.max_dense = sb.max_dense.max(rec.key);
+                            sb.dense_n += 1;
                         }
                         sb.recs.push(rec);
                     }
@@ -1091,21 +1321,25 @@ pub fn run_pipeline(
         };
         let t_ingest = t1.elapsed();
         let (dsu_res, t_dsu_start) = dsu_handle.join().unwrap();
-        let (uf, lm, side) = dsu_res?;
-        Ok((uf, lm, side, inputs, t_ingest, t_dsu_start.elapsed()))
+        let (uf, lm, side, utab) = dsu_res?;
+        Ok((uf, lm, utab, side, inputs, t_ingest, t_dsu_start.elapsed()))
     })?;
     let dsu_ref = &dsu;
     let t2 = t1;
     let ins_nanos = std::sync::atomic::AtomicU64::new(0);
     let emit_nanos = std::sync::atomic::AtomicU64::new(0);
+    let dense_rows = std::sync::atomic::AtomicU64::new(0);
     let mut t_clicks_wall = std::time::Duration::ZERO;
 
     // Dedup (CPU/RAM-bound) and click CSV ingest (I/O+parse-bound) overlap:
     // dedup runs on a scoped worker while clicks stream through the pool.
     let shard_inputs_ref = &shard_inputs;
     let link_maps_ref = &link_maps;
+    let utab_ref = &utab;
+    let ukey_v = us_key.unwrap_or(0);
     let ins_ref = &ins_nanos;
     let emit_ref = &emit_nanos;
+    let dense_ref = &dense_rows;
     let mut click_parts_res: Option<io::Result<Vec<Vec<Vec<ClickRec>>>>> = None;
     let click_min_ts = catalog.window_start - CLICK_REACH_MS;
     type DedupOut = (
@@ -1141,6 +1375,10 @@ pub fn run_pipeline(
                     let bits = DEDUP_TAB.with(|t| {
                         dedup_insert_mark(bufs, &mut t.borrow_mut(), ins_ref)
                     });
+                    dense_ref.fetch_add(
+                        bufs.iter().map(|b| b.dense_n).sum(),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                     let winners: usize = bits
                         .iter()
                         .flat_map(|w| w.iter())
@@ -1154,6 +1392,8 @@ pub fn run_pipeline(
                         bufs,
                         &bits,
                         link_maps_ref,
+                        utab_ref,
+                        ukey_v,
                         dsu_ref,
                         se_ref,
                         &mut parts,
@@ -1211,14 +1451,23 @@ pub fn run_pipeline(
                 if ts < click_min_ts || ts >= window_end {
                     return;
                 }
-                // Resolve to canon_key at parse: fast users probe the link
-                // map (miss = self-canonical); rare slow users resolve bytes
-                // through the DSU like emit's slow path.
-                let (uk, uslow) = field_key(user_raw, b'u');
-                let ck = if !uslow && uk != 0 {
-                    link_maps_ref[(uk >> SHARD_SHIFT) as usize].get(uk).unwrap_or(uk)
+                // Resolve to canon_key at parse: counter users hit the dense
+                // canon table, fast users probe the link map (miss = self-
+                // canonical); rare slow users resolve bytes through the DSU
+                // like emit's slow path.
+                let ck = if let Some(v) = us_key.and_then(|k| {
+                    counters::decode(user_raw, b'u', k, counters::USER_CAP)
+                }) {
+                    dense_canon(v, utab_ref, dsu_ref, ukey_v, &[])
                 } else {
-                    field_key(dsu_ref.resolve(user_raw), b'u').0
+                    let (uk, uslow) = field_key(user_raw, b'u');
+                    if !uslow && uk != 0 {
+                        link_maps_ref[(uk >> SHARD_SHIFT) as usize]
+                            .get(uk)
+                            .unwrap_or(uk)
+                    } else {
+                        field_key(dsu_ref.resolve(user_raw), b'u').0
+                    }
                 };
                 parts[(ck >> SHARD_SHIFT) as usize].push(ClickRec {
                     canon_key: ck,
@@ -1383,10 +1632,11 @@ pub fn run_pipeline(
     };
     let _ = debug_bench;
     eprintln!(
-        "[bench] threads={} avx2={} spill={} cat={:.3}s dsu={:.3}s ingest={:.3}s dedup={:.3}s ins_cpu={:.3}s map={:.3}s emit_cpu={:.3}s clicks={:.3}s cres={:.3}s events={:.3}s sess={:.3}s parquet={:.3}s total={:.3}s user_rows={} camp_rows={}",
+        "[bench] threads={} avx2={} spill={} dense={} cat={:.3}s dsu={:.3}s ingest={:.3}s dedup={:.3}s ins_cpu={:.3}s map={:.3}s emit_cpu={:.3}s clicks={:.3}s cres={:.3}s events={:.3}s sess={:.3}s parquet={:.3}s total={:.3}s user_rows={} camp_rows={}",
         threads,
         avx2,
         spill,
+        dense_rows.load(std::sync::atomic::Ordering::Relaxed),
         t_cat.as_secs_f64(),
         t_dsu_wall.as_secs_f64(),
         t_ingest.as_secs_f64(),

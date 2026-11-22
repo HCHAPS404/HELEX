@@ -1,4 +1,5 @@
 mod catalog;
+mod counters;
 mod csv_dialect;
 mod dsu;
 mod io_pool;
