@@ -377,8 +377,11 @@ fn dedup_insert_mark(
                 if tab.keys[i] == key {
                     let eb = &bufs[(v >> 24) as usize & 0x7F];
                     let erec = &eb.recs[(v & 0xFF_FFFF) as usize];
-                    let same = if rec.id_loc >= ID_DENSE && erec.id_loc >= ID_DENSE {
-                        true
+                    // Equal u64 keys mean equal ids only when both records
+                    // use the same key domain (inline bytes or counters);
+                    // cross-domain numeric collisions must keep probing.
+                    let same = if rec.id_loc >= ID_DENSE || erec.id_loc >= ID_DENSE {
+                        rec.id_loc == erec.id_loc
                     } else {
                         key_bytes(rec.key, b'e', &sb.side, rec.id_loc, &mut tmp_a)
                             == key_bytes(
