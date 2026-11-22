@@ -117,10 +117,17 @@ impl Uf {
         };
         self.parent[child as usize] = root;
         self.size[root as usize] += self.size[child as usize];
-        let rm = self.min_of[root as usize];
-        let cm = self.min_of[child as usize];
-        if self.cmp_ids(cm, rm) == Ordering::Less {
-            self.min_of[root as usize] = cm;
+    }
+
+    /// Component minimum by byte-wise ID order, computed in one pass after
+    /// all unions (each vertex compared once against the running min).
+    fn compute_mins(&mut self) {
+        for i in 0..self.keys.len() as u32 {
+            let r = self.find(i);
+            let m = self.min_of[r as usize];
+            if self.cmp_ids(i, m) == Ordering::Less {
+                self.min_of[r as usize] = i;
+            }
         }
     }
 }
@@ -151,6 +158,7 @@ pub fn load_links(data_dir: &Path) -> io::Result<Dsu> {
             }
         });
     }
+    uf.compute_mins();
     let n = uf.keys.len();
     let mut map = KeyMap::with_capacity(n.max(1));
     let mut canon: Vec<u64> = Vec::new();

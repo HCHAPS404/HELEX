@@ -457,6 +457,7 @@ struct P3 {
     in_active: Vec<bool>,
     active: Vec<u32>,
     day_cat_rev: Vec<u64>,
+    part_durs: Vec<(usize, f64, usize)>,
 }
 
 struct Ctx<'a> {
@@ -1280,17 +1281,38 @@ pub fn run_pipeline(
             in_active: vec![false; num_camps],
             active: Vec::with_capacity(64),
             day_cat_rev: vec![0; num_cats],
+            part_durs: Vec::new(),
         },
         |st, p| {
             let pbl: Vec<&[Blk<PRec>]> = pb.iter().map(|t| t[p].as_slice()).collect();
             let cbl: Vec<&[Blk<CkRec>]> = cb.iter().map(|t| t[p].as_slice()).collect();
+            let pt = Instant::now();
             process_partition(st, ctx_r, &pbl, &cbl);
+            st.part_durs.push((
+                p,
+                pt.elapsed().as_secs_f64(),
+                pbl.iter()
+                    .map(|b| b.iter().map(|x| x.n as usize).sum::<usize>())
+                    .sum(),
+            ));
             if st.rows.len() >= BATCH_ROWS {
                 flush_rows(st, ud, cats);
             }
         },
     );
     let t_sess = t3.elapsed();
+    if std::env::var("HELEX_PTAIL").is_ok() {
+        let mut d: Vec<_> = p3_states
+            .iter()
+            .flat_map(|s| s.part_durs.iter().copied())
+            .collect();
+        d.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        let tot: f64 = d.iter().map(|x| x.1).sum();
+        for &(p, dur, nrec) in d.iter().take(8) {
+            eprintln!("[ptail] part={p} dur={dur:.3}s recs={nrec}");
+        }
+        eprintln!("[ptail] sum={tot:.3}s top8={:.3}s parts={}", d.iter().take(8).map(|x| x.1).sum::<f64>(), d.len());
+    }
 
     // ---- phase 4: output (remaining user rows + campaign table)
     let t4 = Instant::now();
