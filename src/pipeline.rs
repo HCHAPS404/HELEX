@@ -52,7 +52,7 @@ impl Bits {
                 .unwrap_or(d)
         };
         Bits {
-            s1: lg(env("HELEX_S1_TARGET", 10_000)).clamp(6, 13),
+            s1: lg(env("HELEX_S1_TARGET", 80_000)).clamp(6, 13),
             p: lg(env("HELEX_P_TARGET", 40_000)).clamp(4, 11),
         }
     }
@@ -63,7 +63,7 @@ const LATE_LIMIT_MS: i64 = 86_400_000;
 const SESSION_GAP_MS: i64 = 1_800_000;
 const CLICK_REACH_MS: i64 = 7 * DAY_MS;
 
-const CHUNK_DEFAULT: u64 = 256 << 10;
+const CHUNK_DEFAULT: u64 = 1 << 20;
 
 fn chunk_bytes() -> u64 {
     std::env::var("HELEX_CHUNK_KB")
@@ -251,7 +251,13 @@ fn open_inputs(paths: &[PathBuf], kind: Kind, out: &mut Vec<InFile>) -> io::Resu
             continue;
         }
         let map = if use_mmap() {
-            unsafe { memmap2::Mmap::map(&file) }.ok()
+            let m = unsafe { memmap2::Mmap::map(&file) }.ok();
+            if let Some(m) = &m {
+                // Async whole-file readahead: starts the disk->cache fetch for
+                // the entire input while workers still populate per-chunk.
+                let _ = m.advise_range(memmap2::Advice::WillNeed, 0, len as usize);
+            }
+            m
         } else {
             None
         };
@@ -818,7 +824,7 @@ fn flush_rows(st: &mut P3, dir: &Path, cats: &[Vec<u8>]) {
 // ------------------------------------------------------------- line parsers
 
 #[inline(always)]
-fn parse_event_line(st: &mut P1, fields: &[&[u8]; 7], pc: &PCtx, arena: &Arena) {
+fn parse_event_line(st: &mut P1, fields: &[&[u8]; 7], pc: &PCtx, arena: &Arena, lv: usize) {
     let event_id = fields[0];
     if event_id.is_empty() {
         return;
@@ -840,16 +846,18 @@ fn parse_event_line(st: &mut P1, fields: &[&[u8]; 7], pc: &PCtx, arena: &Arena) 
         }
         None => (0, 0),
     };
-    st.ev.push(
-        arena,
-        shard_of(key, st.bits.s1),
-        EvRec {
-            key,
-            ingest,
-            user,
-            ev,
-        },
-    );
+    if lv >= 4 {
+        st.ev.push(
+            arena,
+            shard_of(key, st.bits.s1),
+            EvRec {
+                key,
+                ingest,
+                user,
+                ev,
+            },
+        );
+    }
 }
 
 #[inline(always)]
@@ -1004,6 +1012,10 @@ pub fn run_pipeline(
         camp,
     };
     let pctx_ref = &pctx;
+    let lv: usize = std::env::var("HELEX_PL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5);
     let arena = Arena::new();
     let dsu_cell: OnceLock<io::Result<Dsu>> = OnceLock::new();
     let files_ref = &files;
@@ -1042,8 +1054,8 @@ pub fn run_pipeline(
                 let mut masks = std::mem::take(&mut st.masks);
                 let res = match f.kind {
                     Kind::Events => run_chunk(f, task.start, task.end, &mut buf, |b, first, limit| {
-                        for_each_record::<7>(b, first, limit, &mut masks, |fields| {
-                            parse_event_line(st, fields, pctx_ref, arena_ref)
+                        for_each_record::<7>(b, first, limit, &mut masks, lv, |fields| {
+                            parse_event_line(st, fields, pctx_ref, arena_ref, lv)
                         })
                     }),
                     Kind::Clicks => {
@@ -1055,7 +1067,7 @@ pub fn run_pipeline(
                         };
                         match dsu {
                             Ok(dsu) => run_chunk(f, task.start, task.end, &mut buf, |b, first, limit| {
-                                for_each_record::<4>(b, first, limit, &mut masks, |fields| {
+                                for_each_record::<4>(b, first, limit, &mut masks, lv, |fields| {
                                     parse_click_line(
                                         st,
                                         fields,
