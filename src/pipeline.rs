@@ -322,6 +322,97 @@ fn run_chunk(
 
 const READAHEAD_BYTES: u64 = 192 << 20;
 
+/// One stderr line describing the machine (visible in the scorer logs):
+/// CPU model, detected threads, cgroup limits, THP mode, memory, and how much
+/// of the event input is already in the page cache (cold vs warm start).
+fn report_env(data_dir: &Path, threads: usize) {
+    let rd = |p: &str| fs::read_to_string(p).unwrap_or_default();
+    let cpuinfo = rd("/proc/cpuinfo");
+    let model = cpuinfo
+        .lines()
+        .find(|l| l.starts_with("model name"))
+        .and_then(|l| l.split(':').nth(1))
+        .unwrap_or("?")
+        .trim()
+        .to_string();
+    let ncpu_proc = cpuinfo.lines().filter(|l| l.starts_with("processor")).count();
+    let flags = cpuinfo.lines().find(|l| l.starts_with("flags")).unwrap_or("");
+    let avx512 = flags.contains("avx512bw");
+    let cpu_max = rd("/sys/fs/cgroup/cpu.max").trim().to_string();
+    let mem_max = rd("/sys/fs/cgroup/memory.max").trim().to_string();
+    let thp = rd("/sys/kernel/mm/transparent_hugepage/enabled").trim().to_string();
+    let memtotal = rd("/proc/meminfo")
+        .lines()
+        .find(|l| l.starts_with("MemTotal"))
+        .and_then(|l| l.split_whitespace().nth(1).map(|v| v.to_string()))
+        .unwrap_or_default();
+    // page-cache residency of the first event file (mincore)
+    let mut cached_pct = -1i64;
+    #[cfg(target_os = "linux")]
+    if let Some(p) = csv_paths(&data_dir.join("events")).first() {
+        if let Ok(f) = File::open(p) {
+            if let Ok(m) = unsafe { memmap2::Mmap::map(&f) } {
+                let pages = m.len().div_ceil(4096);
+                let mut vec = vec![0u8; pages];
+                let r = unsafe {
+                    libc::mincore(m.as_ptr() as *mut libc::c_void, m.len(), vec.as_mut_ptr())
+                };
+                if r == 0 && pages > 0 {
+                    cached_pct =
+                        (vec.iter().filter(|&&b| b & 1 != 0).count() * 100 / pages) as i64;
+                }
+            }
+        }
+    }
+    eprintln!(
+        "[env] cpu=\"{model}\" nproc={ncpu_proc} threads={threads} avx512={avx512} cpu.max=\"{cpu_max}\" mem.max={mem_max} memtotal_kb={memtotal} thp=\"{thp}\" ev0_cached_pct={cached_pct}"
+    );
+}
+
+/// Detached background threads issue POSIX_FADV_WILLNEED over all input
+/// files (in 8 MiB pieces, interleaved across threads) so cold reads run at
+/// full device queue depth. Purely advisory: no effect when cached.
+fn prefetch_inputs(data_dir: &Path) {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for sub in ["links", "events", "clicks"] {
+        let mut v = csv_paths(&data_dir.join(sub));
+        if sub == "events" {
+            // same order as the task list: largest first
+            v.sort_by_key(|p| std::cmp::Reverse(p.metadata().map(|m| m.len()).unwrap_or(0)));
+        }
+        paths.extend(v);
+    }
+    let mut pieces: Vec<(usize, u64, u64)> = Vec::new();
+    let mut files: Vec<File> = Vec::new();
+    for p in paths {
+        let Ok(f) = File::open(&p) else { continue };
+        let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+        let fi = files.len();
+        files.push(f);
+        let mut s = 0u64;
+        while s < len {
+            let e = (s + (8 << 20)).min(len);
+            pieces.push((fi, s, e - s));
+            s = e;
+        }
+    }
+    let files = std::sync::Arc::new(files);
+    let pieces = std::sync::Arc::new(pieces);
+    let next = std::sync::Arc::new(AtomicUsize::new(0));
+    let n_threads: usize = std::env::var("HELEX_RA_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8);
+    for _ in 0..n_threads {
+        let (files, pieces, next) = (files.clone(), pieces.clone(), next.clone());
+        std::thread::spawn(move || loop {
+            let i = next.fetch_add(1, AtOrd::Relaxed);
+            let Some(&(fi, off, len)) = pieces.get(i) else { break };
+            readahead(&files[fi], off, len);
+        });
+    }
+}
+
 fn readahead(f: &File, off: u64, len: u64) {
     #[cfg(target_os = "linux")]
     unsafe {
@@ -1013,6 +1104,15 @@ pub fn run_pipeline(
 ) -> io::Result<()> {
     let t0 = Instant::now();
     let threads = worker_count();
+    report_env(data_dir, threads);
+    // Cold-cache input: ask the kernel for every input file right away, from
+    // several threads, so the disk sees deep queues while we load the
+    // catalog/links and parse. Order = processing order (links, events,
+    // clicks). HELEX_RA=throttle keeps the old windowed readahead only.
+    let ra_mode = std::env::var("HELEX_RA").unwrap_or_default();
+    if ra_mode == "all" {
+        prefetch_inputs(data_dir);
+    }
     let catalog = Catalog::load(data_dir)?;
     if catalog.categories.len() > 127 {
         return Err(io::Error::new(
@@ -1137,34 +1237,42 @@ pub fn run_pipeline(
             let _ = dsu_cell_ref.set(load_links(data_dir, dsu_threads));
             t.elapsed()
         });
-        if !std::env::var("HELEX_RA").is_ok_and(|v| v == "0") {
-            sc.spawn(move || {
-                let mut ahead: u64 = 0;
-                let mut issued = 0usize;
-                while issued < tasks_ref.len() && !ra_done_ref.load(AtOrd::Relaxed) {
-                    let c = claimed_ref.load(AtOrd::Relaxed);
-                    if issued < c {
-                        // workers overtook us: no point reading behind them
-                        issued = c;
-                        ahead = 0;
-                        continue;
+        if ra_mode != "0" && ra_mode != "all" {
+            // Windowed readahead: K threads issue WILLNEED for the chunks
+            // just ahead of the furthest one claimed by the parse workers.
+            let ra_threads: usize = std::env::var("HELEX_RA_THREADS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1);
+            let win_mb: u64 = std::env::var("HELEX_RA_WIN_MB")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(READAHEAD_BYTES >> 20);
+            let win_tasks = ((win_mb << 20) / chunk.max(1)).max(1) as usize;
+            let issue = &*Box::leak(Box::new(AtomicUsize::new(0)));
+            for _ in 0..ra_threads {
+                sc.spawn(move || loop {
+                    if ra_done_ref.load(AtOrd::Relaxed) {
+                        break;
                     }
-                    if issued > c && ahead >= READAHEAD_BYTES {
-                        std::thread::sleep(std::time::Duration::from_micros(200));
-                        // recompute window
-                        ahead = tasks_ref[c.min(issued)..issued]
-                            .iter()
-                            .map(|t| t.end - t.start)
-                            .sum();
-                        continue;
+                    let i = issue.fetch_add(1, AtOrd::Relaxed);
+                    if i >= tasks_ref.len() {
+                        break;
                     }
-                    let t = &tasks_ref[issued];
-                    let f = &files_ref[t.file];
-                    readahead(&f.file, t.start, t.end - t.start);
-                    ahead += t.end - t.start;
-                    issued += 1;
-                }
-            });
+                    loop {
+                        let c = claimed_ref.load(AtOrd::Relaxed);
+                        if i <= c + win_tasks || ra_done_ref.load(AtOrd::Relaxed) {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_micros(100));
+                    }
+                    if i + 1 < claimed_ref.load(AtOrd::Relaxed) {
+                        continue; // workers already past it
+                    }
+                    let t = &tasks_ref[i];
+                    readahead(&files_ref[t.file].file, t.start, t.end - t.start);
+                });
+            }
         }
         let states = par_tasks(
             tasks_ref.len(),
