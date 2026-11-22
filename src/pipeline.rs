@@ -250,26 +250,9 @@ fn open_inputs(paths: &[PathBuf], kind: Kind, out: &mut Vec<InFile>) -> io::Resu
         if len == 0 {
             continue;
         }
-        // Header = first line.
-        let mut probe = vec![0u8; 64 << 10];
-        let mut off = 0u64;
-        let data_start = loop {
-            let want = (probe.len() as u64).min(len - off) as usize;
-            file.read_exact_at(&mut probe[..want], off)?;
-            if let Some(nl) = memchr::memchr(b'\n', &probe[..want]) {
-                break Some(off + nl as u64 + 1);
-            }
-            off += want as u64;
-            if off >= len {
-                break None;
-            }
-        };
-        let Some(data_start) = data_start else {
-            continue;
-        };
-        if data_start >= len {
-            continue;
-        }
+        // No header probe: chunk 0 of each file starts at byte 0 and, like
+        // every other chunk, skips its first (partial) line, i.e. the header.
+        let data_start = 0u64;
         let map = if use_mmap() {
             unsafe { memmap2::Mmap::map(&file) }.ok()
         } else {
@@ -295,7 +278,7 @@ fn run_chunk(
     buf: &mut Vec<u8>,
     body: impl FnOnce(&[u8], bool, usize),
 ) -> io::Result<()> {
-    let from = if start == f.data_start {
+    let from = if start == 0 {
         start
     } else {
         start - 1
@@ -316,7 +299,7 @@ fn run_chunk(
                 from as usize,
                 stop - from as usize,
             );
-            body(&m[from as usize..stop], start == f.data_start, limit);
+            body(&m[from as usize..stop], false, limit);
             return Ok(());
         }
     }
@@ -333,7 +316,7 @@ fn run_chunk(
         }
         want = (want * 2).min((f.len - from) as usize);
     }
-    body(&buf[..want], start == f.data_start, limit);
+    body(&buf[..want], false, limit);
     Ok(())
 }
 
@@ -448,6 +431,7 @@ struct P1 {
     slow_u: Vec<(u64, Box<[u8]>)>,
     long_cids: Vec<Box<[u8]>>,
     ck_pend: Vec<CkRec>,
+    ck_defer: Vec<CkRec>,
     buf: Vec<u8>,
     masks: Masks,
     err: Option<io::Error>,
@@ -956,7 +940,7 @@ fn parse_click_line(
     st: &mut P1,
     fields: &[&[u8]; 4],
     pc: &PCtx,
-    dsu: &Dsu,
+    dsu: Option<&Dsu>,
     arena: &Arena,
     click_min_ts: i64,
     window_end: i64,
@@ -990,16 +974,21 @@ fn parse_click_line(
             CID_LONG,
         )
     };
-    // Linked-ID resolution is a DRAM-latency lookup: queue the click, issue
-    // a prefetch, and resolve in batches.
-    dsu.prefetch(uk);
-    st.ck_pend.push(CkRec {
+    let rec = CkRec {
         canon: uk,
         cid,
         ts: (ts - click_min_ts) as u32,
         camp,
         form,
-    });
+    };
+    let Some(dsu) = dsu else {
+        st.ck_defer.push(rec);
+        return;
+    };
+    // Linked-ID resolution is a DRAM-latency lookup: queue the click, issue
+    // a prefetch, and resolve in batches.
+    dsu.prefetch(uk);
+    st.ck_pend.push(rec);
     if st.ck_pend.len() >= CK_BATCH {
         flush_clicks(st, dsu, arena);
     }
@@ -1117,7 +1106,9 @@ pub fn run_pipeline(
     // first in the task order); click chunks wait for it.
     let dsu_cell: std::sync::OnceLock<io::Result<Dsu>> = std::sync::OnceLock::new();
     let dsu_cell_ref = &dsu_cell;
-    let dsu_threads = (threads / 4).clamp(1, 2);
+    // DSU work is short (~0.2 CPU-s); all threads keep its serial span small
+    // even while it competes with the parse workers.
+    let dsu_threads = threads.max(2);
     let files_ref = &files;
     let tasks_ref = &tasks;
     let arena_ref = &arena;
@@ -1133,6 +1124,13 @@ pub fn run_pipeline(
     let (p1_states, t_dsu) = std::thread::scope(|sc| {
         let dsu_thread = sc.spawn(move || {
             let t = Instant::now();
+            // test hook: force the deferred-click path
+            if let Some(ms) = std::env::var("HELEX_TEST_DSU_DELAY_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+            {
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+            }
             let _ = dsu_cell_ref.set(load_links(data_dir, dsu_threads));
             t.elapsed()
         });
@@ -1178,6 +1176,7 @@ pub fn run_pipeline(
                 slow_u: Vec::new(),
                 long_cids: Vec::new(),
                 ck_pend: Vec::with_capacity(CK_BATCH),
+                ck_defer: Vec::new(),
                 buf: Vec::with_capacity((chunk + TAIL) as usize + PAD),
                 masks: Masks::default(),
                 err: None,
@@ -1198,17 +1197,9 @@ pub fn run_pipeline(
                         })
                     }),
                     Kind::Clicks => {
-                        let dsu = loop {
-                            if let Some(d) = dsu_cell_ref.get() {
-                                break d;
-                            }
-                            std::thread::yield_now();
-                        };
-                        let Ok(dsu) = dsu else {
-                            st.buf = buf;
-                            st.masks = masks;
-                            return;
-                        };
+                        // Never wait for the linked-ID build: clicks parsed
+                        // before it is ready are resolved after phase 1.
+                        let dsu = dsu_cell_ref.get().and_then(|r| r.as_ref().ok());
                         let r = run_chunk(f, task.start, task.end, &mut buf, |b, first, limit| {
                             for_each_record::<4>(b, first, limit, &mut masks, #[inline(always)] |fields| {
                                 parse_click_line(
@@ -1222,7 +1213,9 @@ pub fn run_pipeline(
                                 )
                             })
                         });
-                        flush_clicks(st, dsu, arena_ref);
+                        if let Some(dsu) = dsu {
+                            flush_clicks(st, dsu, arena_ref);
+                        }
                         r
                     }
                 };
@@ -1238,6 +1231,26 @@ pub fn run_pipeline(
     });
     let t_p1end = Instant::now();
     let dsu = dsu_cell.into_inner().unwrap()?;
+    // Resolve clicks deferred while the DSU was still building (parallel).
+    let mut p1_states = p1_states;
+    if p1_states.iter().any(|st| !st.ck_defer.is_empty()) {
+        let dsu_r0 = &dsu;
+        std::thread::scope(|sc| {
+            for st in p1_states.iter_mut() {
+                sc.spawn(move || {
+                    let defer = std::mem::take(&mut st.ck_defer);
+                    for (i, c) in defer.iter().enumerate() {
+                        if let Some(nx) = defer.get(i + 16) {
+                            dsu_r0.prefetch(nx.canon);
+                        }
+                        let mut c = *c;
+                        c.canon = dsu_r0.resolve(c.canon);
+                        st.ck.push(arena_ref, shard_of(c.canon, st.bits.p), c);
+                    }
+                });
+            }
+        });
+    }
     let mut ev_blocks: Vec<Vec<Vec<Blk<Ev24>>>> = Vec::with_capacity(threads);
     let mut wides: Vec<Vec<EvRec>> = Vec::with_capacity(threads);
     let mut ck_blocks: Vec<Vec<Vec<Blk<CkRec>>>> = Vec::with_capacity(threads);
@@ -1278,28 +1291,52 @@ pub fn run_pipeline(
     };
 
     // Wide records (purchases, out-of-range ingest deltas): counting-sort by
-    // dedup shard.
+    // dedup shard, in parallel per worker list.
     let ns1 = 1usize << bits.s1;
+    let hists: Vec<Vec<usize>> = std::thread::scope(|sc| {
+        let hs: Vec<_> = wides
+            .iter()
+            .map(|w| {
+                sc.spawn(move || {
+                    let mut h = vec![0usize; ns1];
+                    for r in w {
+                        h[shard_of(r.key, bits.s1)] += 1;
+                    }
+                    h
+                })
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
     let mut woff = vec![0usize; ns1 + 1];
-    for w in &wides {
-        for r in w {
-            woff[shard_of(r.key, bits.s1) + 1] += 1;
+    // per-worker write cursors: shard-major, worker-minor
+    let mut cursors: Vec<Vec<usize>> = vec![vec![0usize; ns1]; wides.len()];
+    {
+        let mut acc = 0usize;
+        for sh in 0..ns1 {
+            woff[sh] = acc;
+            for (wi, h) in hists.iter().enumerate() {
+                cursors[wi][sh] = acc;
+                acc += h[sh];
+            }
         }
-    }
-    for i in 0..ns1 {
-        woff[i + 1] += woff[i];
+        woff[ns1] = acc;
     }
     let mut wide_all: Vec<EvRec> = Vec::with_capacity(woff[ns1]);
     {
-        let mut cur = woff.clone();
-        let dst = wide_all.as_mut_ptr();
-        for w in &wides {
-            for r in w {
-                let sh = shard_of(r.key, bits.s1);
-                unsafe { dst.add(cur[sh]).write(*r) };
-                cur[sh] += 1;
+        let dst = wide_all.as_mut_ptr() as usize;
+        std::thread::scope(|sc| {
+            for (w, mut cur) in wides.iter().zip(cursors.into_iter()) {
+                sc.spawn(move || {
+                    let dst = dst as *mut EvRec;
+                    for r in w {
+                        let sh = shard_of(r.key, bits.s1);
+                        unsafe { dst.add(cur[sh]).write(*r) };
+                        cur[sh] += 1;
+                    }
+                });
             }
-        }
+        });
         unsafe { wide_all.set_len(woff[ns1]) };
     }
     drop(wides);
