@@ -24,6 +24,7 @@ use crate::arena::{Arena, Blk, Scatter};
 use crate::catalog::Catalog;
 use crate::csv_dialect::parse_price_cents;
 use crate::csv_scan::{for_each_record, Masks};
+use crate::counters;
 use crate::dsu::{csv_paths, load_links, Dsu};
 use crate::keys::{fast_key_bytes, id_key, id_key_padded, is_slow, mix64, shard_of, KeyMap};
 use crate::parquet_out::{
@@ -148,6 +149,8 @@ struct PCtx<'a> {
     prod: KeyMap,
     /// fast campaign key -> campaign id
     camp: KeyMap,
+    /// recovered generator event key: (key, shard_shift, index_mask)
+    dense_e: Option<(u64, u32, u64)>,
 }
 
 impl PCtx<'_> {
@@ -842,7 +845,13 @@ fn parse_event_line(st: &mut P1, fields: &[&[u8]; 7], pc: &PCtx, arena: &Arena) 
     let Some(ingest) = (unsafe { parse_ts_padded(fields[3]) }) else {
         return;
     };
-    let (key, _) = unsafe { id_key_padded(event_id, b'e') };
+    let ctr = pc
+        .dense_e
+        .and_then(|(k, _, _)| counters::decode(event_id, b'e', k, counters::EVENT_CAP));
+    let (key, dshard, dflag) = match (ctr, pc.dense_e) {
+        (Some(c), Some((_, shift, _))) => (c, Some(c >> shift), i64::MIN),
+        _ => (unsafe { id_key_padded(event_id, b'e') }.0, None, 0),
+    };
     let (user, ev) = match validate_event_copy(fields, ingest, pc) {
         Some(ev) => {
             let (uk, slow_u) = unsafe { id_key_padded(fields[1], b'u') };
@@ -853,12 +862,13 @@ fn parse_event_line(st: &mut P1, fields: &[&[u8]; 7], pc: &PCtx, arena: &Arena) 
         }
         None => (0, 0),
     };
+    let shard = dshard.map(|s| s as usize).unwrap_or_else(|| shard_of(key, st.bits.s1));
     st.ev.push(
         arena,
-        shard_of(key, st.bits.s1),
+        shard,
         EvRec {
             key,
-            ingest,
+            ingest: ingest | dflag,
             user,
             ev,
         },
@@ -1015,10 +1025,36 @@ pub fn run_pipeline(
             camp.get_or_insert(k, i as u32);
         }
     }
+    // Recover the generator's id->counter keys from the events heads; when
+    // it converges, dense counters give direct-index dedup (byte-key path
+    // stays for everything that does not decode).
+    let heads: Vec<Vec<u8>> = files
+        .iter()
+        .filter(|f| f.kind == Kind::Events)
+        .map(|f| {
+            let want = ((f.len - f.data_start).min(256 << 10)) as usize;
+            if let Some(m) = &f.map {
+                m[f.data_start as usize..f.data_start as usize + want].to_vec()
+            } else {
+                let mut b = vec![0u8; want];
+                let _ = f.file.read_exact_at(&mut b, f.data_start);
+                b
+            }
+        })
+        .collect();
+    let dense_e = counters::recover(&heads).and_then(|k| {
+        if k.ok && bits.s1 <= 28 {
+            Some((k.event, 28 - bits.s1, (1u64 << (28 - bits.s1)) - 1))
+        } else {
+            None
+        }
+    });
+    eprintln!("[dense] enabled={}", dense_e.is_some());
     let pctx = PCtx {
         catalog: &catalog,
         prod,
         camp,
+        dense_e,
     };
     let pctx_ref = &pctx;
     let arena = Arena::new();
@@ -1154,16 +1190,26 @@ pub fn run_pipeline(
         out: Scatter<PRec>,
         // interleaved [key, winner ingest, winner index] slots; key 0 = empty
         tab: Vec<[u64; 3]>,
+        // dense: [shard_tag, (ingest<<23)|(idx+1)] direct-indexed slots;
+        // stale tags from previous shards read as empty (no clearing).
+        dtab: Vec<[u64; 2]>,
+        // dense overflow hash (idx cap / huge ingest): [counter+1, ingest, i]
+        dhash: Vec<[u64; 3]>,
+        dfill: usize,
         // bit i set => record i of this shard is the current table winner;
         // emit becomes a sequential bit scan instead of a probe per record.
         win: Vec<u64>,
     }
+    let dense_shift = dense_e.map(|(_, s, _)| s);
     let p2_states = par_tasks(
         1 << bits.s1,
         threads,
         |_| P2 {
             out: Scatter::new(1 << bits.p),
             tab: Vec::new(),
+            dtab: Vec::new(),
+            dhash: Vec::new(),
+            dfill: 0,
             win: Vec::new(),
         },
         |st, s| {
@@ -1189,19 +1235,106 @@ pub fn run_pipeline(
             let mask = cap - 1;
             let tab = &mut st.tab[..cap];
             let win = &mut st.win[..nw];
+            // Dense direct table: covers counters [s<<shift, (s+1)<<shift).
+            let (dsize, dmask, dtag) = match dense_shift {
+                Some(sh) => (1usize << sh, (1u64 << sh) - 1, s as u64 + 1),
+                None => (0, 0, 0),
+            };
+            if dsize > 0 {
+                if st.dtab.len() < dsize {
+                    st.dtab = vec![[0u64; 2]; dsize];
+                }
+                if st.dhash.len() < 64 {
+                    st.dhash = vec![[0u64; 3]; 64];
+                }
+                st.dhash.iter_mut().for_each(|e| *e = [0; 3]);
+                st.dfill = 0;
+            }
+            let dl = st.dtab.len().min(dsize);
+            let dtab = &mut st.dtab[..dl];
             let mut i: u32 = 0;
             for w in evb.iter() {
                 for b in w[s].iter() {
                     let recs = b.as_slice();
-                    for (j8, r) in recs.iter().enumerate() {
+                    'rec: for (j8, r) in recs.iter().enumerate() {
                         #[cfg(target_arch = "x86_64")]
                         if let Some(nx) = recs.get(j8 + 8) {
-                            let slot = (mix64(nx.key) as usize) & mask;
                             unsafe {
-                                core::arch::x86_64::_mm_prefetch(
-                                    tab.as_ptr().add(slot) as *const i8,
-                                    core::arch::x86_64::_MM_HINT_T0,
-                                );
+                                let p = if nx.ingest < 0 {
+                                    dtab.as_ptr().add((nx.key & dmask) as usize) as *const i8
+                                } else {
+                                    tab.as_ptr().add((mix64(nx.key) as usize) & mask) as *const i8
+                                };
+                                core::arch::x86_64::_mm_prefetch(p, core::arch::x86_64::_MM_HINT_T0);
+                            }
+                        }
+                        let mut ri = r.ingest;
+                        if ri < 0 {
+                            // Dense record: counter-direct slot or overflow hash.
+                            ri &= i64::MAX;
+                            let ing = ri as u64;
+                            if ing < (1u64 << 41) && (i as u64) < ((1u64 << 23) - 1) {
+                                let e = unsafe { dtab.get_unchecked_mut((r.key & dmask) as usize) };
+                                if e[0] != dtag {
+                                    e[0] = dtag;
+                                    e[1] = (ing << 23) | (i as u64 + 1);
+                                    win[i as usize >> 6] |= 1u64 << (i & 63);
+                                } else if ing < (e[1] >> 23) {
+                                    let old = ((e[1] & ((1u64 << 23) - 1)) - 1) as usize;
+                                    win[old >> 6] &= !(1u64 << (old & 63));
+                                    win[i as usize >> 6] |= 1u64 << (i & 63);
+                                    e[1] = (ing << 23) | (i as u64 + 1);
+                                }
+                                i += 1;
+                                continue;
+                            }
+                            let k = r.key + 1;
+                            // Existing key probes are cheap; only a fresh
+                            // insert may need the table to grow first.
+                            loop {
+                                let dmask2 = st.dhash.len() - 1;
+                                let mut j = (mix64(k) as usize) & dmask2;
+                                let mut full = false;
+                                loop {
+                                    let e = unsafe { st.dhash.get_unchecked_mut(j) };
+                                    if e[0] == 0 {
+                                        full = true;
+                                        break;
+                                    }
+                                    if e[0] == k {
+                                        if ri < e[1] as i64 {
+                                            let old = e[2] as usize;
+                                            win[old >> 6] &= !(1u64 << (old & 63));
+                                            win[i as usize >> 6] |= 1u64 << (i & 63);
+                                            e[1] = ri as u64;
+                                            e[2] = i as u64;
+                                        }
+                                        i += 1;
+                                        continue 'rec;
+                                    }
+                                    j = (j + 1) & dmask2;
+                                }
+                                if full && (st.dfill + 1) * 2 <= st.dhash.len() {
+                                    let e = unsafe { st.dhash.get_unchecked_mut(j) };
+                                    *e = [k, ri as u64, i as u64];
+                                    st.dfill += 1;
+                                    win[i as usize >> 6] |= 1u64 << (i & 63);
+                                    i += 1;
+                                    continue 'rec;
+                                }
+                                // dhash too full: rehash at 2x and retry.
+                                let nl = st.dhash.len() * 2;
+                                let old = std::mem::replace(&mut st.dhash, vec![[0u64; 3]; nl]);
+                                let nm = st.dhash.len() - 1;
+                                for e in old {
+                                    if e[0] != 0 {
+                                        let mut j = (mix64(e[0]) as usize) & nm;
+                                        while st.dhash[j][0] != 0 {
+                                            j = (j + 1) & nm;
+                                        }
+                                        st.dhash[j] = e;
+                                    }
+                                }
                             }
                         }
                         let k = r.key;

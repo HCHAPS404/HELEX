@@ -1,5 +1,6 @@
 mod arena;
 mod catalog;
+mod counters;
 mod csv_dialect;
 mod csv_scan;
 mod dsu;
