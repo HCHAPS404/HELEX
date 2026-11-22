@@ -9,7 +9,24 @@ RUN mkdir src && echo "fn main() {}" > src/main.rs \
     && cargo build --release --target x86_64-unknown-linux-gnu && rm -rf src
 
 COPY src/ ./src/
-RUN touch src/main.rs && cargo build --release --target x86_64-unknown-linux-gnu
+COPY scripts/pgo_gen.sh /build/pgo_gen.sh
+
+# PGO: instrumented build -> profile run on synthetic data -> merge -> final.
+RUN touch src/main.rs \
+    && RUSTFLAGS="$RUSTFLAGS -C profile-generate=/build/pgo" \
+       cargo build --release --target x86_64-unknown-linux-gnu \
+    && sed -i 's/\r$//' /build/pgo_gen.sh \
+    && sh /build/pgo_gen.sh /build/pgdata \
+    && mkdir -p /tmp/po /tmp/ps \
+    && DATA_DIR=/build/pgdata OUTPUT_DIR=/tmp/po SCRATCH_DIR=/tmp/ps NCPU=4 \
+       ./target/x86_64-unknown-linux-gnu/release/shopping-sessions \
+    && rustup component add llvm-tools-preview \
+    && "$(rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-gnu/bin/llvm-profdata" \
+       merge -o /build/merged.profdata /build/pgo \
+    && rm -rf /build/pgo /build/pgdata /tmp/po /tmp/ps \
+    && touch src/main.rs \
+    && RUSTFLAGS="$RUSTFLAGS -C profile-use=/build/merged.profdata" \
+       cargo build --release --target x86_64-unknown-linux-gnu
 
 FROM scratch
 

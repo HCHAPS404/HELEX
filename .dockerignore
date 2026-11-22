@@ -9,4 +9,5 @@ requirements.txt
 .git/
 .devin/
 scripts/
+!scripts/pgo_gen.sh
 tools/
