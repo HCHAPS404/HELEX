@@ -985,6 +985,8 @@ pub fn run_pipeline(
     let day0 = ws.div_euclid(DAY_MS) as i32;
     let num_days = ((we - 1).div_euclid(DAY_MS) as i32 - day0) as usize + 1;
     let click_min_ts = ws - CLICK_REACH_MS;
+    // F1 prefix cache: months from the click lookback through late ingests.
+    crate::timestamp::seed_prefix_cache(click_min_ts - DAY_MS);
     let t_cat = t0.elapsed();
 
     // ---- phase 1: parse
@@ -1447,8 +1449,18 @@ pub fn run_pipeline(
     let camp_rows_n = cw.close()?;
     let t_out = t4.elapsed();
 
+    let anon_mb = fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|st| {
+            st.lines()
+                .find(|l| l.starts_with("RssAnon:"))
+                .and_then(|l| l.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok()))
+        })
+        .unwrap_or(0)
+        / 1024;
     eprintln!(
-        "[bench] threads={} cat={:.3}s dsu={:.3}s parse={:.3}s dedup={:.3}s sess={:.3}s out={:.3}s total={:.3}s user_rows={} camp_rows={}",
+        "[bench] anon_mb={} threads={} cat={:.3}s dsu={:.3}s parse={:.3}s dedup={:.3}s sess={:.3}s out={:.3}s total={:.3}s user_rows={} camp_rows={}",
+        anon_mb,
         threads,
         t_cat.as_secs_f64(),
         t_dsu.as_secs_f64(),

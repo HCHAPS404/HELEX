@@ -178,6 +178,59 @@ fn byte(w: u64, i: u32) -> u32 {
     ((w >> (8 * i)) & 0xFF) as u32
 }
 
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+/// "YYYY-MM-" prefix cache for the months around the data window: a hit
+/// replaces the year/month digit checks and the month-table lookup with one
+/// u64 compare. Slot = [prefix word, (month base days << 32) | month length].
+static PREFIX: [[AtomicU64; 2]; 4] = [
+    [AtomicU64::new(0), AtomicU64::new(0)],
+    [AtomicU64::new(0), AtomicU64::new(0)],
+    [AtomicU64::new(0), AtomicU64::new(0)],
+    [AtomicU64::new(0), AtomicU64::new(0)],
+];
+
+/// Seeds the prefix cache with up to 4 consecutive months starting at the
+/// month of `from_ms` (epoch ms).
+pub fn seed_prefix_cache(from_ms: i64) {
+    let mut days = from_ms.div_euclid(86_400_000);
+    // civil month of `days`
+    let civil = |d: i64| -> (i64, i64) {
+        let z = d + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let y = yoe + era * 400 + i64::from(m <= 2);
+        (y, m)
+    };
+    for slot in PREFIX.iter() {
+        let (y, m) = civil(days);
+        if !(1..=9999).contains(&y) {
+            break;
+        }
+        let txt = format!("{y:04}-{m:02}-");
+        let w = u64::from_le_bytes(txt.as_bytes().try_into().unwrap());
+        let len = match m {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            _ => {
+                if is_leap_year(y) {
+                    29
+                } else {
+                    28
+                }
+            }
+        };
+        let base = days_from_civil(y, m, 1) - 1;
+        slot[1].store(((base as u64) << 32) | len as u64, Relaxed);
+        slot[0].store(w, Relaxed);
+        days = days_from_civil(y, m, 1) + len as i64; // first day of next month
+    }
+}
+
 /// SWAR parse of `YYYY-MM-DDTHH:MM:SS` + suffix byte at 19 (caller checked).
 ///
 /// # Safety
@@ -195,9 +248,32 @@ unsafe fn parse_civil_swar(p: *const u8) -> Option<i64> {
     if (w0 & M0) != E0 || (w1 & M1) != E1 || (w2 & 0xFF) != 0x3A {
         return None;
     }
-    let d0 = w0 ^ ASCII0;
     let d1 = w1 ^ ASCII0;
     let d2 = w2 ^ (ASCII0 & 0xFFFF_FFFF);
+    for slot in PREFIX.iter() {
+        if slot[0].load(Relaxed) == w0 {
+            const DM1: u64 = 0xFFFF_00FF_FF00_FFFF;
+            const DM2: u64 = 0x0000_0000_00FF_FF00;
+            if !(digits_ok(d1, DM1) && digits_ok(d2, DM2)) {
+                return None;
+            }
+            let meta = slot[1].load(Relaxed);
+            let day = byte(d1, 0) * 10 + byte(d1, 1);
+            if day.wrapping_sub(1) >= (meta & 0xFFFF_FFFF) as u32 {
+                return None;
+            }
+            let hour = byte(d1, 3) * 10 + byte(d1, 4);
+            let minute = byte(d1, 6) * 10 + byte(d1, 7);
+            let second = byte(d2, 1) * 10 + byte(d2, 2);
+            if hour > 23 || minute > 59 || second > 59 {
+                return None;
+            }
+            let days = i64::from((meta >> 32) as u32 as i32) + i64::from(day);
+            let tod = i64::from(hour * 3_600 + minute * 60 + second);
+            return Some((days * 86_400 + tod) * 1_000);
+        }
+    }
+    let d0 = w0 ^ ASCII0;
     const DM0: u64 = 0x00FF_FF00_FFFF_FFFF; // bytes 0-3, 5, 6
     const DM1: u64 = 0xFFFF_00FF_FF00_FFFF; // bytes 0,1,3,4,6,7
     const DM2: u64 = 0x0000_0000_00FF_FF00; // bytes 1,2
@@ -455,6 +531,14 @@ mod tests {
                 cases.push(v);
             }
         }
+        seed_prefix_cache(1_790_812_800_000 - 40 * 86_400_000); // around 2026-10
+        cases.push(b"2026-09-31T00:00:00Z".to_vec());
+        cases.push(b"2026-09-30T23:59:59Z".to_vec());
+        cases.push(b"2026-08-31T23:59:59Z".to_vec());
+        cases.push(b"2026-11-01T00:00:00Z".to_vec());
+        cases.push(b"2026-10-00T00:00:00Z".to_vec());
+        cases.push(b"2026-10-3aT00:00:00Z".to_vec());
+        cases.push(b"2026-10-03T0a:00:00Z".to_vec());
         for c in cases {
             let mut padded = c.clone();
             padded.extend_from_slice(&[0x5A; 32]);

@@ -1,6 +1,6 @@
 //! Block arena + per-worker scatter buffers.
 //!
-//! Records are appended into fixed 16 KiB blocks carved from large anonymous
+//! Records are appended into fixed 8 KiB blocks carved from large anonymous
 //! mappings (huge-page advised). Blocks never move (no Vec realloc/memmove),
 //! and blocks of a consumed partition go back to a free list so the next
 //! phase writes into pages that are already faulted in instead of zeroing
@@ -8,7 +8,7 @@
 
 use std::sync::Mutex;
 
-pub const BLOCK_BYTES: usize = 16 << 10;
+pub const BLOCK_BYTES: usize = 8 << 10;
 const REGION_BYTES: usize = 256 << 20;
 
 struct Inner {
