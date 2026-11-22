@@ -1108,7 +1108,10 @@ pub fn run_pipeline(
     let dsu_cell_ref = &dsu_cell;
     // DSU work is short (~0.2 CPU-s); all threads keep its serial span small
     // even while it competes with the parse workers.
-    let dsu_threads = threads.max(2);
+    let dsu_threads = std::env::var("HELEX_DSU_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or((threads / 2).clamp(1, 4));
     let files_ref = &files;
     let tasks_ref = &tasks;
     let arena_ref = &arena;
