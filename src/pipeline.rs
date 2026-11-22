@@ -87,7 +87,6 @@ const ID_TAG: u64 = 1 << 63;
 // id_loc/user_loc values: u32::MAX = plain inline key, ID_DENSE = key holds a
 // generator counter (see counters.rs), anything below = side-arena offset.
 const ID_DENSE: u32 = u32::MAX - 1;
-const EMPTY_LOC: u32 = u32::MAX;
 
 // Invalid flag lives in bit 0 of the packed ingest field:
 // ingest = (ingest_ms << 1) | invalid — ordering is preserved, so dedup's
@@ -260,12 +259,15 @@ fn validate_event_copy<'a>(
 }
 
 // Open-addressing dedup table: keys[i] is the record's u64 key, vals[i] packs
-// [buf:8 | rec:24]. Winner is the copy with minimum ingest_ms; emit skips it
-// if that copy is invalid. Inline (loc == MAX) keys compare by value alone.
+// [gen:32 | invalid:1 | buf:7 | rec:24]. Winner is the copy with minimum
+// ingest_ms; emit skips it if that copy is invalid. Inline (loc == MAX) keys
+// compare by value alone. A slot only counts when its gen tag matches the
+// table generation — reset between shards is a counter bump, not a fill.
 struct DedupTab {
     keys: Vec<u64>,
-    vals: Vec<u32>,
+    vals: Vec<u64>,
     mask: usize,
+    gen: u32,
 }
 
 impl DedupTab {
@@ -274,6 +276,7 @@ impl DedupTab {
             keys: Vec::new(),
             vals: Vec::new(),
             mask: 0,
+            gen: 0,
         }
     }
 
@@ -282,14 +285,16 @@ impl DedupTab {
         let cap = (est * 2).next_power_of_two().max(64);
         if self.keys.len() != cap {
             self.keys.resize(cap, 0);
-            self.vals.resize(cap, EMPTY_LOC);
+            self.vals.resize(cap, 0);
         }
-        self.vals.fill(EMPTY_LOC);
+        // Monotonic gen: fresh slots read 0 in their tag half, so gen must
+        // never return to 0 (it can't wrap under 2^32 resets anyway).
+        self.gen = self.gen.wrapping_add(1);
         self.mask = cap - 1;
     }
 }
 
-// vals entry: [invalid:1 | buf:7 | rec:24] — the invalid flag travels in the
+// loc entry: [invalid:1 | buf:7 | rec:24] — the invalid flag travels in the
 // entry so the winner sweep never touches records.
 #[inline]
 fn pack_loc(invalid: bool, buf_idx: usize, rec_idx: usize) -> u32 {
@@ -358,13 +363,15 @@ fn dedup_insert_mark(
                     );
                 }
             }
+            let gen = tab.gen;
             let inv = rec.ingest & 1 != 0;
             let mut i = (mix64(key) as usize) & tab.mask;
             loop {
                 let v = tab.vals[i];
-                if v == EMPTY_LOC {
+                if (v >> 32) as u32 != gen {
                     tab.keys[i] = key;
-                    tab.vals[i] = pack_loc(inv, buf_idx, rec_idx);
+                    tab.vals[i] =
+                        ((gen as u64) << 32) | u64::from(pack_loc(inv, buf_idx, rec_idx));
                     break;
                 }
                 if tab.keys[i] == key {
@@ -384,7 +391,8 @@ fn dedup_insert_mark(
                     };
                     if same {
                         if rec.ingest < erec.ingest {
-                            tab.vals[i] = pack_loc(inv, buf_idx, rec_idx);
+                            tab.vals[i] = ((gen as u64) << 32)
+                                | u64::from(pack_loc(inv, buf_idx, rec_idx));
                         }
                         break;
                     }
@@ -400,7 +408,7 @@ fn dedup_insert_mark(
         .collect();
     let mut win_bits = win_bits;
     for &v in tab.vals.iter() {
-        if v == EMPTY_LOC || v >> 31 != 0 {
+        if (v >> 32) as u32 != tab.gen || (v as u32) >> 31 != 0 {
             continue;
         }
         let b = ((v >> 24) & 0x7F) as usize;
