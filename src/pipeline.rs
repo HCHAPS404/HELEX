@@ -317,6 +317,23 @@ fn run_chunk(
     Ok(())
 }
 
+const READAHEAD_BYTES: u64 = 192 << 20;
+
+fn readahead(f: &File, off: u64, len: u64) {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        use std::os::unix::io::AsRawFd;
+        libc::posix_fadvise(
+            f.as_raw_fd(),
+            off as libc::off_t,
+            len as libc::off_t,
+            libc::POSIX_FADV_WILLNEED,
+        );
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (f, off, len);
+}
+
 fn use_mmap() -> bool {
     !std::env::var("HELEX_IO").is_ok_and(|v| v == "pread")
 }
@@ -1017,12 +1034,48 @@ pub fn run_pipeline(
     let arena_ref = &arena;
     let dsu_cell_ref = &dsu_cell;
 
+    // Readahead: a helper thread asks the kernel to page in input ahead of
+    // the parse workers (matters when the page cache is cold); throttled to
+    // stay at most READAHEAD_BYTES past the furthest claimed chunk.
+    let claimed = AtomicUsize::new(0);
+    let claimed_ref = &claimed;
+    let ra_done = std::sync::atomic::AtomicBool::new(false);
+    let ra_done_ref = &ra_done;
     let (p1_states, t_dsu) = std::thread::scope(|sc| {
         let dsu_thread = sc.spawn(|| {
             let t = Instant::now();
             let _ = dsu_cell_ref.set(load_links(data_dir));
             t.elapsed()
         });
+        if !std::env::var("HELEX_RA").is_ok_and(|v| v == "0") {
+            sc.spawn(move || {
+                let mut ahead: u64 = 0;
+                let mut issued = 0usize;
+                while issued < tasks_ref.len() && !ra_done_ref.load(AtOrd::Relaxed) {
+                    let c = claimed_ref.load(AtOrd::Relaxed);
+                    if issued < c {
+                        // workers overtook us: no point reading behind them
+                        issued = c;
+                        ahead = 0;
+                        continue;
+                    }
+                    if issued > c && ahead >= READAHEAD_BYTES {
+                        std::thread::sleep(std::time::Duration::from_micros(200));
+                        // recompute window
+                        ahead = tasks_ref[c.min(issued)..issued]
+                            .iter()
+                            .map(|t| t.end - t.start)
+                            .sum();
+                        continue;
+                    }
+                    let t = &tasks_ref[issued];
+                    let f = &files_ref[t.file];
+                    readahead(&f.file, t.start, t.end - t.start);
+                    ahead += t.end - t.start;
+                    issued += 1;
+                }
+            });
+        }
         let states = par_tasks(
             tasks_ref.len(),
             threads,
@@ -1043,6 +1096,7 @@ pub fn run_pipeline(
                 if st.err.is_some() {
                     return;
                 }
+                claimed_ref.fetch_max(ti, AtOrd::Relaxed);
                 let task = &tasks_ref[ti];
                 let f = &files_ref[task.file];
                 let mut buf = std::mem::take(&mut st.buf);
@@ -1089,6 +1143,7 @@ pub fn run_pipeline(
                 }
             },
         );
+        ra_done_ref.store(true, AtOrd::Relaxed);
         (states, dsu_thread.join().unwrap())
     });
     let dsu = dsu_cell.into_inner().unwrap()?;

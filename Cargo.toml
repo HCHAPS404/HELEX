@@ -12,6 +12,7 @@ bytes = "=1.12.2"
 hashbrown = "=0.17.1"
 memchr = "=2.8.3"
 memmap2 = "=0.9.8"
+libc = "=0.2.191"
 mimalloc = { version = "=0.1.52", default-features = false }
 parquet = { version = "=60.1.0", default-features = false, features = ["snap"] }
 rustc-hash = "=2.1.3"
