@@ -28,6 +28,10 @@ class ARGS:
     # like "HELEX_DENSE=1+bin=alt;HELEX_DENSE=0+bin=alt". Every k=v becomes an
     # env override except bin, which selects the binary name.
     variants = os.environ.get("VARIANTS", "")
+    # Optional third-party binary to A/B against (black-box testbench):
+    # local path copied to /usr/local/bin/shopping-sessions-tb, used via
+    # variant key bin=tb.
+    tb_bin = os.environ.get("TB_BIN", "")
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -67,6 +71,12 @@ if ARGS.generator_dir:
                 f'cd /build && RUSTFLAGS="-C target-cpu=x86-64-v2 {ARGS.rustflags_alt}" cargo build --release',
                 "cp /build/target/release/shopping-sessions /usr/local/bin/shopping-sessions-alt",
             )
+        if ARGS.tb_bin:
+            _img = _img.add_local_file(
+                os.path.join(REPO, ARGS.tb_bin),
+                "/usr/local/bin/shopping-sessions-tb",
+                copy=True,
+            ).run_commands("chmod 755 /usr/local/bin/shopping-sessions-tb")
     image = _img
 else:
     image = _base
