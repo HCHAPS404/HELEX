@@ -127,3 +127,29 @@ Measured A/B (`shopping-sessions`, 12 threads, generated sets):
 Verified bit-identical output vs byte path: 36/36 fixtures, seeds
 2/7/15/62 (~85K), 1M and 8M sets (913,543 user rows / 28,014 camp rows).
 `dense=` field in the bench line reports counter-keyed records.
+
+### Session: tagged-canon keys + scorer-faithful Modal A/B
+
+- **Tagged canon_key domain (`3985ae2`)**: generator-decodable canonical
+  ids carry `DENSE_TAG|counter` as canon_key (the tag embeds a NUL byte no
+  `field_key` can emit). Self-canonical rows cost one utab read + ALU —
+  encode+pack happens once per group in `process_partition`, not per row.
+  `canon_key_of()` keeps the domain uniform across dense/linkmap/DSU
+  resolution; `canon_part()` spreads dense keys by user index.
+- **Same-container Modal A/B (`modal_bench.py`)**: `VARIANTS` env runs
+  interleaved configurations in one container (node variance cancels);
+  `RUSTFLAGS_ALT` builds a second binary for build-flag A/B; per-variant
+  output dirs keep the invariant check on variant 0.
+
+Measured on Modal `cpu=8.0, mem=24GB`, 20M events / 5M clicks, seed 3,
+same-container interleaved runs:
+
+| Variante | total wall | ins_cpu | emit_cpu | notas |
+|---|---|---|---|---|
+| dense tagged (`3985ae2`) | **1.02-1.13 s** | 0.33-0.40 | **0.74-0.93** | invariants 5/5, RSS ~2.9 GB |
+| dense pre-tag (`61fd8ca`) | 1.03-1.14 s | 0.28-0.31 | 1.06-1.12 | emit -22% con tag |
+| byte path (`HELEX_DENSE=0`) | 1.26-1.43 s | 0.79-0.86 | 1.51-1.65 | fallback intacto |
+| `x86-64-v3` vs `v2` (bin A/B) | ~-2-4% | ~par | 0.98-1.10 | dentro del ruido, dirección consistente |
+
+Node variance across containers is ±30% (same build measured 1.03-1.35s
+on different nodes) — only same-container interleaved medians are used.
