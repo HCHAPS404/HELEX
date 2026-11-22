@@ -1312,11 +1312,11 @@ pub fn run_pipeline(
                 } else {
                     let mut sb = ShardBuf::new();
                     let mut pos = 0usize;
-                    while pos + 52 <= b.len() {
+                    while pos + std::mem::size_of::<EvRecord>() + 4 <= b.len() {
                         let mut rec: EvRecord = unsafe {
                             std::ptr::read_unaligned(b[pos..].as_ptr() as *const EvRecord)
                         };
-                        pos += 48;
+                        pos += std::mem::size_of::<EvRecord>();
                         let side_len =
                             u32::from_le_bytes(b[pos..pos + 4].try_into().unwrap())
                                 as usize;
